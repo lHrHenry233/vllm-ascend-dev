@@ -378,7 +378,7 @@ Before merging, verify:
 
 - [ ] Commit messages are clear and descriptive, following Conventional Commits format
 - [ ] **All commits are signed off** (`git commit -s`)
-- [ ] PR is created from your fork repository, not directly from the main repository
+- [ ] PR is created in your private repository (or private fork), not in the `vllm-project/vllm-ascend` community repository
 - [ ] PR description is complete, following the PR template
 - [ ] All review comments addressed
 
@@ -399,14 +399,15 @@ Before merging, verify:
    bash format.sh ci
    ```
    > **Note**: This check is required for **all file types**, including markdown files. If `markdownlint` modifies files, re-add them with `git add` and commit again.
-10. Push to your fork repository (NOT the main repository):
+10. Push to your private repository (or private fork):
 
    ```bash
-   git remote add myfork https://github.com/YOUR_USERNAME/vllm-ascend.git
+   git remote add myfork https://github.com/YOUR_USERNAME/vllm-ascend-dev.git
    git push -u myfork your-branch-name
    ```
 
-11. Create a PR from your fork to the main repository with clear description
+11. Create a PR in your private repository (for example, from your branch to your repo default branch)
+12. If you accidentally opened a PR in `vllm-project/vllm-ascend`, close that PR and reopen it in your private repository
 
 ---
 
