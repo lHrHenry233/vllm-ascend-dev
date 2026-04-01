@@ -93,6 +93,10 @@ struct CausalConv1dTilingData {
     // Channel-wise tiling
     int64_t dimTileSize;
     int64_t blocksPerSeq;
+
+    // cacheIndices shape mode: 0 -> [batch], 1 -> [batch, maxQueryLen]
+    int64_t cacheIndicesMode;
+    int64_t maxQueryLen;
 };
 #endif // CAUSAL_CONV1D_TILING_DATA_H_
 
@@ -383,6 +387,8 @@ __aicore__ inline void CausalConv1d<T>::Process()
     const int32_t seqLen = tilingData_->seqLen;
     const int32_t dimTileSize = static_cast<int32_t>(tilingData_->dimTileSize);
     const int32_t blocksPerSeq = static_cast<int32_t>(tilingData_->blocksPerSeq);
+    const int32_t cacheIndicesMode = static_cast<int32_t>(tilingData_->cacheIndicesMode);
+    const int32_t maxQueryLen = static_cast<int32_t>(tilingData_->maxQueryLen);
 
     const uint32_t blockIdx = GetBlockIdx();
     const uint32_t blockNum = GetBlockNum();
@@ -417,16 +423,52 @@ __aicore__ inline void CausalConv1d<T>::Process()
             continue;
         }
 
-        const int32_t cacheIdx = cacheIndicesGm.GetValue(seq);
-        if (cacheIdx == tilingData_->padSlotId) {
-            continue;
+        int32_t cacheIdx = 0;
+        if (cacheIndicesMode == 0) {
+            cacheIdx = cacheIndicesGm.GetValue(seq);
+            if (cacheIdx == tilingData_->padSlotId) {
+                continue;
+            }
+        } else {
+            if (maxQueryLen <= 0) {
+                continue;
+            }
+            cacheIdx = cacheIndicesGm.GetValue(static_cast<int64_t>(seq) * maxQueryLen);
+            if (cacheIdx == tilingData_->padSlotId) {
+                continue;
+            }
+            if (len > maxQueryLen) {
+                // guard for malformed metadata; fallback to final-state path only
+                len = maxQueryLen;
+            }
         }
 
         const bool hasInit = hasInitialStateGm.GetValue(seq);
 
         InitRing(cacheIdx, hasInit, start, len, c0, dimTileSize, dim, dbg);
         RunSeq(start, len, c0, dimTileSize, dim, dbg);
-        WriteBackState(cacheIdx, len, c0, dimTileSize, dim, dbg);
+        if (cacheIndicesMode == 0) {
+            WriteBackState(cacheIdx, len, c0, dimTileSize, dim, dbg);
+        } else {
+            const int32_t stateLen = tilingData_->stateLen;
+            LocalTensor<T> ring = inBuf.Get<T>();
+            for (int32_t t = 0; t < len; ++t) {
+                const int32_t tokenCacheIdx =
+                    cacheIndicesGm.GetValue(static_cast<int64_t>(seq) * maxQueryLen + t);
+                if (tokenCacheIdx == tilingData_->padSlotId) {
+                    continue;
+                }
+                for (int32_t pos = 0; pos < (MAX_WIDTH - 1); ++pos) {
+                    const int32_t tap = (MAX_WIDTH - 2) - pos;
+                    const int32_t slot = (tap == 0) ? SlotCurr(t) : SlotHist(t, tap);
+                    const int64_t stateOffset =
+                        static_cast<int64_t>(tokenCacheIdx) * stateLen * dim + static_cast<int64_t>(pos) * dim + c0;
+                    PipeBarrier<PIPE_ALL>();
+                    DataCopy(convStatesGm[stateOffset], ring[slot * MAX_BLOCK_DIM], dimTileSize);
+                    PipeBarrier<PIPE_ALL>();
+                }
+            }
+        }
     }
 
     ReleaseEvents();

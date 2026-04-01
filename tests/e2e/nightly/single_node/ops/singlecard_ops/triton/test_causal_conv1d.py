@@ -10,6 +10,63 @@ from vllm_ascend.ops.triton.mamba.causal_conv1d import \
     causal_conv1d_update_npu as causal_conv1d_update
 from vllm_ascend.utils import enable_custom_op
 
+
+def test_ascend_causal_conv1d_2d_state_indices_writeback():
+    """Validate token-level state snapshots when cache indices are 2D [batch, max_query_len]."""
+    torch.random.manual_seed(0)
+    enable_custom_op()
+
+    device = "npu"
+    dtype = torch.float16
+    dim = 384  # keep aligned with kernel tiling candidates
+    width = 4
+    state_len = width - 1
+
+    # Two variable-length sequences: [3, 2]
+    query_start_loc = torch.tensor([0, 3, 5], device=device, dtype=torch.int32)
+    x_cpu = torch.stack(
+        [torch.full((dim,), float(i + 1), dtype=torch.float32) for i in range(5)],
+        dim=0,
+    )
+    x = x_cpu.to(device=device, dtype=dtype)
+
+    # Zero weights isolate state writeback semantics from convolution math.
+    weight = torch.zeros((width, dim), device=device, dtype=dtype)
+    conv_states = torch.zeros((32, state_len, dim), device=device, dtype=dtype)
+    has_initial_state = torch.tensor([False, False], device=device, dtype=torch.bool)
+    cache_indices_2d = torch.tensor(
+        [
+            [10, 11, 12],
+            [20, 21, PAD_SLOT_ID],
+        ],
+        device=device,
+        dtype=torch.int32,
+    )
+
+    _ = torch.ops._C_ascend.causal_conv1d_fn(
+        x,
+        weight,
+        None,
+        activation="silu",
+        conv_state=conv_states,
+        has_initial_state=has_initial_state,
+        non_spec_state_indices_tensor=cache_indices_2d,
+        non_spec_query_start_loc=query_start_loc,
+        pad_slot_id=PAD_SLOT_ID,
+    )
+
+    conv_cpu = conv_states.float().cpu()
+    expected = {
+        10: torch.stack([torch.zeros(dim), torch.zeros(dim), x_cpu[0]], dim=0),
+        11: torch.stack([torch.zeros(dim), x_cpu[0], x_cpu[1]], dim=0),
+        12: torch.stack([x_cpu[0], x_cpu[1], x_cpu[2]], dim=0),
+        20: torch.stack([torch.zeros(dim), torch.zeros(dim), x_cpu[3]], dim=0),
+        21: torch.stack([torch.zeros(dim), x_cpu[3], x_cpu[4]], dim=0),
+    }
+
+    for cache_line, ref in expected.items():
+        validate_cmp(conv_cpu[cache_line], ref, torch.float32, device="cpu")
+
 def validate_cmp(y_cal, y_ref, dtype, device='npu'):
     y_cal = y_cal.to(device)
     y_ref = y_ref.to(device)

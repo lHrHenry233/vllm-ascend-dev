@@ -47,8 +47,8 @@ from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import DeviceMemoryProfiler
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
-from vllm.v1.attention.backends.utils import CommonAttentionMetadata
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata, GDNAttentionMetadataBuilder
+from vllm.v1.attention.backends.utils import CommonAttentionMetadata, PAD_SLOT_ID
 from vllm.v1.attention.selector import get_attn_backend  # type: ignore
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.kv_cache_interface import (
@@ -77,6 +77,10 @@ from vllm.v1.sample.rejection_sampler import RejectionSampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
+from vllm.v1.worker import mamba_utils
+from vllm.v1.worker.cp_utils import (
+    get_total_cp_world_size,
+)
 from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput, GPUModelRunner
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
@@ -108,6 +112,7 @@ from vllm_ascend.patch.worker.patch_draft_quarot import patch_load_weights
 from vllm_ascend.patch.worker.patch_module import patch_torch_npu_argsort
 from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
+from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
 from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
 from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer
@@ -393,6 +398,18 @@ class NPUModelRunner(GPUModelRunner):
         self.cpu_slot_mapping = None
         self.sampling_done_event: torch.npu.Event | None = None
 
+        if vllm_version_is("0.17.0"):
+            # self.cudagraph_batch_sizes sorts in ascending order.
+            if (
+                self.compilation_config.cudagraph_capture_sizes
+                and self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
+            ):
+                self.cudagraph_batch_sizes = sorted(self.compilation_config.cudagraph_capture_sizes)
+            else:
+                self.cudagraph_batch_sizes = []
+        self.mamba_state_idx: dict[str, int] = {}
+        self._mamba_copy_bufs: mamba_utils.MambaCopyBuffers | None = None
+
     @property
     def use_cp(self) -> bool:
         return self.pcp_size * self.dcp_size > 1
@@ -406,7 +423,12 @@ class NPUModelRunner(GPUModelRunner):
     def _set_up_drafter(self):
         # Set up speculative decoding.
         self.drafter: (
-            AscendNgramProposer | AscendEagleProposer | AscendSuffixDecodingProposer | AscendMedusaProposer | None
+            AscendNgramProposer
+            | AscendEagleProposer
+            | AscendDraftModelProposer
+            | AscendSuffixDecodingProposer
+            | AscendMedusaProposer
+            | None
         ) = None
         self.actual_seq_lengths_q: list[int] = []
         self.decode_token_per_req = 1
@@ -420,9 +442,6 @@ class NPUModelRunner(GPUModelRunner):
                     assert isinstance(self.drafter, AscendEagleProposer)
                     self.use_aux_hidden_state_outputs = self.drafter.eagle3_use_aux_hidden_state
                 self.rejection_sampler = RejectionSampler(self.sampler)
-            self.actual_seq_lengths_q = list(
-                range(self.decode_token_per_req, self.max_num_tokens + 1, self.decode_token_per_req)
-            )
         self.discard_request_indices = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
         self.num_discarded_requests = 0
 
@@ -521,11 +540,24 @@ class NPUModelRunner(GPUModelRunner):
             return self.model.unwrap()
         return self.model
 
-    def _pad_query_start_loc_for_fia(self, num_tokens_padded: int, num_reqs_padded: int, num_reqs: int) -> int:
+    def _pad_query_start_loc_for_fia(
+        self,
+        num_tokens_padded: int,
+        num_reqs_padded: int,
+        num_reqs: int,
+        cudagraph_runtime_mode: CUDAGraphMode | None = None,
+        batch_desc_num_reqs: int | None = None,
+    ) -> int:
         """
         This function is only designed to satisfied the constraint that when the layout is TND,
         the first dimension of `hidden_states` must equal the last element of `actual_seq_lengths_q`.
         """
+        # TODO: need refactor later, related to vllm PR #34043 this pr delete func
+        # relax_for_mixed_batch_cudagraphs, num_reqs no longer equals the actual number of requests.
+        if cudagraph_runtime_mode == CUDAGraphMode.FULL:
+            num_reqs_padded = num_reqs
+        else:
+            num_reqs_padded = batch_desc_num_reqs if batch_desc_num_reqs is not None else num_reqs
 
         if num_tokens_padded == num_reqs_padded * self.uniform_decode_query_len:
             # Uniform-batch case: num_reqs must be no greater than num_reqs_padded
@@ -961,7 +993,7 @@ class NPUModelRunner(GPUModelRunner):
             draft_token_ids = self.drafter.propose(
                 valid_sampled_token_ids, sampling_metadata, spec_decode_metadata, sample_hidden_states
             )
-        elif self.speculative_config.use_eagle():
+        elif self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model():
             common_attn_metadata = spec_decode_common_attn_metadata
             sampled_token_ids = valid_sampled_token_ids
 
@@ -1008,6 +1040,8 @@ class NPUModelRunner(GPUModelRunner):
                 long_seq_metadata = None  # type: ignore
                 num_prefill_reqs = 0
                 num_decode_reqs = 0
+
+            num_rejected_tokens_gpu = None
             if spec_decode_metadata is None:
                 # update pcp related params
                 if self.pcp_size > 1:
@@ -1016,7 +1050,7 @@ class NPUModelRunner(GPUModelRunner):
                     target_positions = self._get_positions(num_scheduled_tokens)
                     target_hidden_states = hidden_states
                     if self.use_aux_hidden_state_outputs:
-                        target_hidden_states = torch.cat([h[:num_scheduled_tokens] for h in aux_hidden_states], dim=-1)
+                        target_hidden_states = torch.cat([h for h in aux_hidden_states], dim=-1)
                 else:
                     token_indices_to_sample = None
                     # input_ids can be None for multimodal models.
@@ -1043,8 +1077,10 @@ class NPUModelRunner(GPUModelRunner):
                     )
                 else:
                     assert self.drafter is not None
-                    common_attn_metadata, token_indices, token_indices_to_sample = self.drafter.prepare_inputs_padded(
-                        common_attn_metadata, spec_decode_metadata, valid_sampled_tokens_count
+                    common_attn_metadata, token_indices, token_indices_to_sample, num_rejected_tokens_gpu = (
+                        self.drafter.prepare_inputs_padded(
+                            common_attn_metadata, spec_decode_metadata, valid_sampled_tokens_count
+                        )
                     )
                 if self.pcp_size > 1:
                     target_token_ids = input_ids_pcp_full[token_indices]
@@ -1065,7 +1101,7 @@ class NPUModelRunner(GPUModelRunner):
                 target_positions=target_positions,
                 target_hidden_states=target_hidden_states,
                 next_token_ids=next_token_ids,
-                last_token_indices=token_indices_to_sample,
+                token_indices_to_sample=token_indices_to_sample,
                 common_attn_metadata=common_attn_metadata,
                 sampling_metadata=sampling_metadata,
                 req_scheduled_tokens=req_scheduled_tokens,
@@ -1074,6 +1110,7 @@ class NPUModelRunner(GPUModelRunner):
                 num_decode_reqs=num_decode_reqs,
                 scheduler_output=scheduler_output,
                 num_scheduled_tokens=num_scheduled_tokens,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             )
         else:
             raise ValueError(f"Unknown speculative decoding method: {self.speculative_config.method}")
@@ -1206,6 +1243,23 @@ class NPUModelRunner(GPUModelRunner):
 
                 pad_attn = cudagraph_mode == CUDAGraphMode.FULL
 
+                # NOTE(Angazenn): According to https://github.com/vllm-project/vllm/pull/30877,
+                # there should be a corresponding 'postprocess_mamba'. However, it is called inside
+                # '_update_states_after_model_execute', which is not overridden in vLLM-Ascend.
+                # We simply utilize the implementation in vLLM.
+                if self.cache_config.mamba_cache_mode in ("align", "all"):
+                    mamba_utils.preprocess_mamba(
+                        scheduler_output,
+                        self.kv_cache_config,
+                        self.cache_config,
+                        self.mamba_state_idx,
+                        self.input_batch,
+                        self.requests,
+                        self.compilation_config.static_forward_context,
+                        self.model.get_mamba_state_copy_func(),
+                        self._get_mamba_copy_bufs(),
+                    )
+
                 use_spec_decode = len(scheduler_output.scheduled_spec_decode_tokens) > 0
                 ubatch_slices_attn = ubatch_slices_padded if pad_attn else ubatch_slices
 
@@ -1218,7 +1272,9 @@ class NPUModelRunner(GPUModelRunner):
                     # Another possible condition is num_tokens_padded != num_tokens_unpadded
                     # but this scope is way too big and the consequences are unpredictable
                     old_num_reqs_padded = num_reqs_padded
-                    num_reqs_padded = self._pad_query_start_loc_for_fia(num_tokens_padded, num_reqs_padded, num_reqs)
+                    num_reqs_padded = self._pad_query_start_loc_for_fia(
+                        num_tokens_padded, num_reqs_padded, num_reqs, cudagraph_mode, batch_desc.num_reqs
+                    )
                     if enable_sp() and num_tokens_padded == num_tokens_unpadded:
                         if num_reqs_padded > old_num_reqs_padded:
                             num_reqs_padded = old_num_reqs_padded
@@ -1291,48 +1347,27 @@ class NPUModelRunner(GPUModelRunner):
 
         # Run forward pass
         clear_kv_metadata = self.speculative_config is None
-        if vllm_version_is("0.16.0"):
-            with (
-                record_function_or_nullcontext("forward"),
-                set_ascend_forward_context(
-                    attn_metadata,
-                    self.vllm_config,
-                    num_tokens=num_tokens_padded,
-                    num_tokens_across_dp=num_tokens_across_dp,
-                    aclgraph_runtime_mode=cudagraph_mode,
-                    batch_descriptor=batch_desc,
-                    num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
-                    model_instance=self.model,
-                    max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
-                    skip_compiled=has_encoder_input,
-                ),
-                self.maybe_get_kv_connector_output(scheduler_output) as kv_connector_output,
-            ):
-                hidden_states = self._model_forward(
-                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
-                )
-        else:
-            with (
-                record_function_or_nullcontext("forward"),
-                set_ascend_forward_context(
-                    attn_metadata,
-                    self.vllm_config,
-                    num_tokens=num_tokens_padded,
-                    num_tokens_across_dp=num_tokens_across_dp,
-                    aclgraph_runtime_mode=cudagraph_mode,
-                    batch_descriptor=batch_desc,
-                    num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
-                    model_instance=self.model,
-                    max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
-                    skip_compiled=has_encoder_input,
-                ),
-                self.maybe_get_kv_connector_output(
-                    scheduler_output, clear_metadata=clear_kv_metadata
-                ) as kv_connector_output,
-            ):
-                hidden_states = self._model_forward(
-                    num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
-                )
+        with (
+            record_function_or_nullcontext("forward"),
+            set_ascend_forward_context(
+                attn_metadata,
+                self.vllm_config,
+                num_tokens=num_tokens_padded,
+                num_tokens_across_dp=num_tokens_across_dp,
+                aclgraph_runtime_mode=cudagraph_mode,
+                batch_descriptor=batch_desc,
+                num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
+                model_instance=self.model,
+                max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
+                skip_compiled=has_encoder_input,
+            ),
+            self.maybe_get_kv_connector_output(
+                scheduler_output, clear_metadata=clear_kv_metadata
+            ) as kv_connector_output,
+        ):
+            hidden_states = self._model_forward(
+                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+            )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
@@ -1418,6 +1453,11 @@ class NPUModelRunner(GPUModelRunner):
 
         if self.execute_model_state is None:
             # Nothing to do (PP non-final rank case), output isn't used.
+            # receive sampled token ids from the last PP rank when using
+            # async scheduling + pipeline parallelism so downstream code
+            # (e.g., PCP input preparation) can access them.
+            if self.use_async_scheduling and get_pp_group().world_size > 1:
+                self._pp_receive_prev_sampled_token_ids_to_input_batch()
             if not kv_connector_output:
                 return None  # noqa
             # In case of PP with kv transfer, we need to pass through the
@@ -1499,16 +1539,16 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
-                use_padded_batch_for_eagle = (
+                use_padded_batch = (
                     self.speculative_config
-                    and self.speculative_config.use_eagle()
+                    and (self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model())
                     and not self.speculative_config.disable_padded_drafter_batch
                 )
-                if use_padded_batch_for_eagle:
+                if use_padded_batch:
                     # EAGLE speculative decoding can use the GPU sampled tokens
                     # as inputs, and does not need to wait for bookkeeping to finish.
                     propose_draft_token_ids(sampler_output.sampled_token_ids)
-                if self.speculative_config and not use_padded_batch_for_eagle:
+                if self.speculative_config and not use_padded_batch:
                     # ngram and other speculative decoding methods use the sampled
                     # tokens on the CPU, so they are run after bookkeeping.
                     propose_draft_token_ids(valid_sampled_token_ids)
@@ -1551,6 +1591,14 @@ class NPUModelRunner(GPUModelRunner):
             ):
                 global_stream().wait_event(self.sampling_done_event)
                 self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
+
+        # In async scheduling + PP, broadcast sampled token ids from the
+        # last PP rank so other PP ranks can receive them without going
+        # through the scheduler/engine IPC path.
+        if self.use_async_scheduling:
+            pp = get_pp_group()
+            if pp.world_size > 1 and pp.is_last_rank:
+                self._pp_broadcast_prev_sampled_token_ids(sampler_output.sampled_token_ids)
 
         if not self.use_async_scheduling:
             return model_runner_output
@@ -1877,23 +1925,14 @@ class NPUModelRunner(GPUModelRunner):
             if force_eager:
                 return (CUDAGraphMode.NONE, BatchDescriptor(num_tokens_padded))
 
-            if vllm_version_is("0.16.0"):
-                return self.cudagraph_dispatcher.dispatch(
-                    num_tokens=num_tokens,
-                    has_lora=has_lora,
-                    uniform_decode=uniform_decode,
-                    disable_full=disable_full,
-                    num_active_loras=num_active_loras,
-                )
-            else:
-                return self.cudagraph_dispatcher.dispatch(
-                    num_tokens=num_tokens,
-                    has_lora=has_lora,
-                    uniform_decode=uniform_decode,
-                    valid_modes=valid_modes,
-                    invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
-                    num_active_loras=num_active_loras,
-                )
+            return self.cudagraph_dispatcher.dispatch(
+                num_tokens=num_tokens,
+                has_lora=has_lora,
+                uniform_decode=uniform_decode,
+                valid_modes=valid_modes,
+                invalid_modes={CUDAGraphMode.FULL} if disable_full else None,
+                num_active_loras=num_active_loras,
+            )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(num_tokens_padded, use_cascade_attn or has_encoder_output)
         num_tokens_padded = batch_descriptor.num_tokens
@@ -1915,16 +1954,10 @@ class NPUModelRunner(GPUModelRunner):
                 dp_rank = self.parallel_config.data_parallel_rank
                 num_tokens_padded = int(num_tokens_across_dp[dp_rank].item())
                 # Re-dispatch with DP padding
-                if vllm_version_is("0.16.0"):
-                    cudagraph_mode, batch_descriptor = dispatch_cudagraph(
-                        num_tokens_padded,
-                        disable_full=synced_cudagraph_mode <= CUDAGraphMode.PIECEWISE.value,
-                    )
-                else:
-                    cudagraph_mode, batch_descriptor = dispatch_cudagraph(
-                        num_tokens_padded,
-                        valid_modes={CUDAGraphMode(synced_cudagraph_mode)},
-                    )
+                cudagraph_mode, batch_descriptor = dispatch_cudagraph(
+                    num_tokens_padded,
+                    valid_modes={CUDAGraphMode(synced_cudagraph_mode)},
+                )
                 # Assert to make sure the agreed upon token count is correct otherwise
                 # num_tokens_across_dp will no-longer be valid
                 assert batch_descriptor.num_tokens == num_tokens_padded
@@ -2073,6 +2106,48 @@ class NPUModelRunner(GPUModelRunner):
             cm_base.num_logits_indices = logits_indices.size(0)
             cm_base.logits_indices_padded = self._prepare_kv_sharing_fast_prefill(logits_indices)
 
+        def _maybe_normalize_mamba_all_prefill_state_indices(attn_metadata_i: AttentionMetadata) -> None:
+            if not (
+                self.cache_config.enable_prefix_caching and self.cache_config.mamba_cache_mode == "all"
+            ):
+                return
+            if not isinstance(attn_metadata_i, GDNAttentionMetadata):
+                return
+            if attn_metadata_i.num_prefills <= 0:
+                return
+
+            state_indices = attn_metadata_i.non_spec_state_indices_tensor
+            query_start_loc = attn_metadata_i.non_spec_query_start_loc
+            if state_indices is None or query_start_loc is None:
+                return
+
+            if state_indices.dim() > 1:
+                attn_metadata_i.non_spec_state_indices_tensor = state_indices.contiguous()
+                return
+
+            seq_lens = query_start_loc[1:] - query_start_loc[:-1]
+            if seq_lens.numel() == 0:
+                attn_metadata_i.non_spec_state_indices_tensor = state_indices.unsqueeze(1).contiguous()
+                return
+            if seq_lens.shape[0] != state_indices.shape[0]:
+                attn_metadata_i.non_spec_state_indices_tensor = state_indices.unsqueeze(1).contiguous()
+                return
+
+            max_query_len = int(seq_lens.max().item())
+            token_state_indices = torch.full(
+                (state_indices.shape[0], max_query_len),
+                PAD_SLOT_ID,
+                dtype=state_indices.dtype,
+                device=state_indices.device,
+            )
+            positions = torch.arange(max_query_len, device=state_indices.device).unsqueeze(0)
+            valid_mask = positions < seq_lens.unsqueeze(1)
+            attn_metadata_i.non_spec_state_indices_tensor = torch.where(
+                valid_mask,
+                state_indices.unsqueeze(1),
+                token_state_indices,
+            ).contiguous()
+
         def _build_attn_group_metadata(
             kv_cache_gid: int,
             attn_gid: int,
@@ -2102,6 +2177,7 @@ class NPUModelRunner(GPUModelRunner):
                     common_attn_metadata=common_attn_metadata,
                     **extra_attn_metadata_args,
                 )
+            _maybe_normalize_mamba_all_prefill_state_indices(attn_metadata_i)
 
             if ubid is None:
                 assert isinstance(attn_metadata, dict)
@@ -2140,7 +2216,7 @@ class NPUModelRunner(GPUModelRunner):
             if kv_cache_gid > 0:
                 cm.block_table_tensor, cm.slot_mapping = _get_block_table_and_slot_mapping(kv_cache_gid)
             if self.speculative_config and spec_decode_common_attn_metadata is None:
-                if isinstance(self.drafter, AscendEagleProposer):
+                if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
                         spec_decode_common_attn_metadata = cm
                 else:
@@ -2324,8 +2400,9 @@ class NPUModelRunner(GPUModelRunner):
             cum_num_tokens, _ = self._get_cumsum_and_arange(num_scheduled_tokens)
             self.query_start_loc.np[1 : num_reqs_padded + 1] = cum_num_tokens
             self.query_start_loc.copy_to_gpu()
-
-            num_reqs_padded = self._pad_query_start_loc_for_fia(num_tokens_padded, num_reqs_padded, num_reqs)
+            num_reqs_padded = self._pad_query_start_loc_for_fia(
+                num_tokens_padded, num_reqs_padded, num_reqs, cudagraph_runtime_mode, batch_desc.num_reqs
+            )
 
             pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
             attn_metadata, _ = self._build_attention_metadata(
@@ -2518,6 +2595,7 @@ class NPUModelRunner(GPUModelRunner):
         """
         kv_cache_config = deepcopy(kv_cache_config)
         self.kv_cache_config = kv_cache_config
+        self._mamba_copy_bufs = None
         self.may_add_encoder_only_layers_to_kv_cache_config()
         self.maybe_add_kv_sharing_layers_to_kv_cache_groups(kv_cache_config)
         # NOTE(cmq): initialize_attn_backend must before using self.attn_groups
@@ -2530,6 +2608,14 @@ class NPUModelRunner(GPUModelRunner):
 
         self.may_reinitialize_input_batch(kv_cache_config)
         kv_caches = self.initialize_kv_cache_tensors(kv_cache_config)
+        if vllm_version_is("0.17.0"):
+            # TODO: refactor the logic of attention
+            # Initialize drafter attention group initialization
+            if self.speculative_config and (
+                self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model()
+            ):
+                assert isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer)
+                self.drafter.initialize_attn_backend(kv_cache_config, self.kernel_block_sizes)
 
         if has_kv_transfer_group():
             get_kv_transfer_group().register_kv_caches(kv_caches)
@@ -2839,8 +2925,8 @@ class NPUModelRunner(GPUModelRunner):
                         # a conv state in some special models.
                         target_shape = (num_blocks, *shape)
 
-                        target_idx += torch.prod(torch.tensor(target_shape)).item()
-                        tensor = raw_tensor.view(dtype)[start_idx:target_idx].view(target_shape)
+                        target_idx += math.prod(target_shape) * get_dtype_size(dtype)
+                        tensor = raw_tensor[start_idx:target_idx].view(dtype).view(target_shape)
                         start_idx = target_idx
                         state_tensors.append(tensor)
                     kv_caches[layer_name] = state_tensors
@@ -2868,7 +2954,7 @@ class NPUModelRunner(GPUModelRunner):
         # For attention backends that support virtual block splitting,
         # use the supported block sizes from the backend
         # For other backends (like Mamba), use [0] (no splitting)
-        kernel_block_sizes = []
+        self.kernel_block_sizes = []
         for kv_cache_group_id, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
             kv_cache_spec = kv_cache_group.kv_cache_spec
             if isinstance(kv_cache_spec, UniformTypeKVCacheSpecs):
@@ -2895,15 +2981,30 @@ class NPUModelRunner(GPUModelRunner):
                 else:
                     # Fallback to cache config block_size if no backend found
                     kernel_block_size_list = [self.cache_config.block_size]
-                kernel_block_sizes.append(kernel_block_size_list)
+                self.kernel_block_sizes.append(kernel_block_size_list)
             else:
                 # This is likely Mamba or other non-attention cache,
                 # no splitting.
                 # NOTE: set kernel_block_sizes to 0 to disable slotmapping computation
                 # of mamba block. In this case, BlockTable.block_size will never equal
                 # to kernel_block_sizes[0]
-                kernel_block_sizes.append([0])
-        if block_sizes != [self.cache_config.block_size] or kernel_block_sizes != [[self.cache_config.block_size]]:
+                self.kernel_block_sizes.append([0])
+
+        max_num_blocks = []
+        max_model_len = max(self.max_model_len, self.max_encoder_len)
+        for i, kv_cache_group in enumerate(kv_cache_config.kv_cache_groups):
+            if isinstance(kv_cache_group.kv_cache_spec, EncoderOnlyAttentionSpec):
+                continue
+            max_num_blocks_per_req = cdiv(max_model_len, block_sizes[i] * get_total_cp_world_size())
+            if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
+                mamba_blocks_per_req = (
+                    max_num_blocks_per_req if self.cache_config.enable_prefix_caching else 1
+                ) + kv_cache_group.kv_cache_spec.num_speculative_blocks
+
+                max_num_blocks_per_req = max(max_num_blocks_per_req, mamba_blocks_per_req)
+            max_num_blocks.append(max_num_blocks_per_req)
+
+        if block_sizes != [self.cache_config.block_size] or self.kernel_block_sizes != [[self.cache_config.block_size]]:
             assert self.cache_config.cpu_offload_gb == 0, (
                 "Cannot re-initialize the input batch when CPU weight "
                 "offloading is enabled. See https://github.com/vllm-project/vllm/pull/18298 "  # noqa: E501
@@ -2911,7 +3012,7 @@ class NPUModelRunner(GPUModelRunner):
             )
             self.input_batch = NPUInputBatch(
                 max_num_reqs=self.max_num_reqs,
-                max_model_len=max(self.model_config.max_model_len, self.max_encoder_len),
+                max_model_len=max_model_len,
                 max_num_batched_tokens=self.max_num_tokens,
                 device=self.device,
                 pin_memory=self.pin_memory,
@@ -2925,7 +3026,8 @@ class NPUModelRunner(GPUModelRunner):
                     if self.vllm_config.speculative_config
                     else 0
                 ),
-                kernel_block_sizes=kernel_block_sizes,
+                kernel_block_sizes=self.kernel_block_sizes,
+                max_num_blocks_per_req=max_num_blocks,
             )
 
     def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:
@@ -3078,8 +3180,6 @@ class NPUModelRunner(GPUModelRunner):
                 mamba_layers[layer_name] = attn_module
 
         if len(mamba_layers) > 0:
-            if self.vllm_config.cache_config.enable_prefix_caching:
-                raise NotImplementedError("Prefix caching is not supported for Mamba yet.")
             mamba_page_size_padded = 0
             for layer_name, mamba_module in mamba_layers.items():
                 if spec := mamba_module.get_kv_cache_spec(self.vllm_config):
@@ -3209,6 +3309,8 @@ def _replace_gpu_model_runner_function_wrapper(target_module_name):
         target_module = sys.modules[target_module_name]
         setattr(target_module, "graph_capture", graph_capture)  # noqa: B010
         yield
+    except Exception as e:
+        raise RuntimeError(f"NPUModelRunner failed, error is {e}")
     finally:
         setattr(target_module, "graph_capture", graph_capture)  # noqa: B010
 

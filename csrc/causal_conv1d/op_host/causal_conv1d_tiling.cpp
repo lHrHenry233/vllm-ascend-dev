@@ -220,8 +220,29 @@ static ge::graphStatus GetShapeDtypeInfo(gert::TilingContext* context, CausalCon
     auto ciShapePtr = context->GetInputShape(CACHE_INDICES_INDEX);
     OP_CHECK_NULL_WITH_CONTEXT(context, ciShapePtr);
     auto ciShape = EnsureNotScalar(ciShapePtr->GetStorageShape());
-    if(ciShape.GetDimNum() != 1){return ge::GRAPH_FAILED;}
-    if(ciShape.GetDim(0) != batch){return ge::GRAPH_FAILED;}
+    int64_t cacheIndicesMode = 0;
+    int64_t maxQueryLen = 1;
+    if (ciShape.GetDimNum() == 1) {
+        if (ciShape.GetDim(0) != batch) {
+            return ge::GRAPH_FAILED;
+        }
+        cacheIndicesMode = 0;
+        maxQueryLen = 1;
+    } else if (ciShape.GetDimNum() == 2) {
+        if (ciShape.GetDim(0) != batch) {
+            return ge::GRAPH_FAILED;
+        }
+        cacheIndicesMode = 1;
+        maxQueryLen = ciShape.GetDim(1);
+        if (maxQueryLen <= 0) {
+            return ge::GRAPH_FAILED;
+        }
+        if (inputMode == 1 && maxQueryLen < seqLen) {
+            return ge::GRAPH_FAILED;
+        }
+    } else {
+        return ge::GRAPH_FAILED;
+    }
     
     auto hisShapePtr = context->GetInputShape(HAS_INITIAL_STATE_INDEX);
     OP_CHECK_NULL_WITH_CONTEXT(context, hisShapePtr);
@@ -289,6 +310,8 @@ static ge::graphStatus GetShapeDtypeInfo(gert::TilingContext* context, CausalCon
     tiling.set_stateLen(stateLen);
     tiling.set_numCacheLines(numCacheLines);
     tiling.set_batch(batch);
+    tiling.set_cacheIndicesMode(cacheIndicesMode);
+    tiling.set_maxQueryLen(maxQueryLen);
     return ge::GRAPH_SUCCESS;
 }
 

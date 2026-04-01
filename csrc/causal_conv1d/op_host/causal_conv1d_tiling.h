@@ -48,6 +48,9 @@ BEGIN_TILING_DATA_DEF(CausalConv1dTilingData)
 
     TILING_DATA_FIELD_DEF(int64_t, dimTileSize);
     TILING_DATA_FIELD_DEF(int64_t, blocksPerSeq);
+
+    TILING_DATA_FIELD_DEF(int64_t, cacheIndicesMode);
+    TILING_DATA_FIELD_DEF(int64_t, maxQueryLen);
 END_TILING_DATA_DEF;
 struct CausalConv1dCompileInfo {
     uint64_t ubSize = 0;
