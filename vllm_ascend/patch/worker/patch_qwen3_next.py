@@ -215,13 +215,14 @@ class AscendQwen3Next_GatedDeltaNet(Qwen3NextGatedDeltaNet):
             actual_seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
             query_spec = l2norm_fwd(query_spec)
             key_spec = l2norm_fwd(key_spec)
+            recurrent_state = ssm_state if ssm_state.dtype == torch.bfloat16 else ssm_state.to(torch.bfloat16)
             core_attn_out_spec = torch_npu.npu_recurrent_gated_delta_rule(
                 query=query_spec.squeeze(0),
                 key=key_spec.squeeze(0),
                 value=value_spec.squeeze(0),
                 g=g_spec.squeeze(0),
                 beta=beta_spec.squeeze(0),
-                state=ssm_state,
+                state=recurrent_state,
                 scale=key_spec.shape[-1] ** -0.5,
                 actual_seq_lengths=actual_seq_lengths,
                 ssm_state_indices=spec_state_indices_tensor.flatten(),
@@ -259,13 +260,14 @@ class AscendQwen3Next_GatedDeltaNet(Qwen3NextGatedDeltaNet):
             actual_seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
             query_non_spec = l2norm_fwd(query_non_spec)
             key_non_spec = l2norm_fwd(key_non_spec)
+            recurrent_state = ssm_state if ssm_state.dtype == torch.bfloat16 else ssm_state.to(torch.bfloat16)
             core_attn_out_non_spec = torch_npu.npu_recurrent_gated_delta_rule(
                 query=query_non_spec.squeeze(0),
                 key=key_non_spec.squeeze(0),
                 value=value_non_spec.squeeze(0),
                 g=g_non_spec.squeeze(0),
                 beta=beta_non_spec.squeeze(0),
-                state=ssm_state,
+                state=recurrent_state,
                 scale=key_non_spec.shape[-1] ** -0.5,
                 actual_seq_lengths=actual_seq_lengths,
                 ssm_state_indices=non_spec_state_indices_tensor,
