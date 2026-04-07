@@ -9,6 +9,8 @@ def _fake_scheduler_init(self, *args, **kwargs):
     self.vllm_config = kwargs["vllm_config"]
     # Baseline behavior for hybrid mamba models.
     self.need_mamba_block_aligned_split = True
+    if hasattr(self.vllm_config, "has_mamba_layers"):
+        self.has_mamba_layers = self.vllm_config.has_mamba_layers
 
 
 class TestRecomputeSchedulerAllMode(unittest.TestCase):
@@ -25,6 +27,13 @@ class TestRecomputeSchedulerAllMode(unittest.TestCase):
                 enable_prefix_caching=enable_prefix_caching,
             ),
         )
+
+    def _build_vllm_config_with_mamba_flag(
+        self, model_type: str, mamba_cache_mode: str, has_mamba_layers: bool, enable_prefix_caching: bool = True
+    ):
+        cfg = self._build_vllm_config(model_type, mamba_cache_mode, enable_prefix_caching)
+        cfg.has_mamba_layers = has_mamba_layers
+        return cfg
 
     @patch("vllm_ascend.core.recompute_scheduler.register_ascend_mla_spec_in_manager", lambda: None)
     @patch("vllm_ascend.core.recompute_scheduler.Scheduler.__init__", new=_fake_scheduler_init)
@@ -61,3 +70,12 @@ class TestRecomputeSchedulerAllMode(unittest.TestCase):
         scheduler = RecomputeScheduler(vllm_config=cfg)
 
         self.assertTrue(scheduler.need_mamba_block_aligned_split)
+
+    @patch("vllm_ascend.core.recompute_scheduler.register_ascend_mla_spec_in_manager", lambda: None)
+    @patch("vllm_ascend.core.recompute_scheduler.Scheduler.__init__", new=_fake_scheduler_init)
+    def test_all_mode_uses_has_mamba_layers_flag_when_available(self):
+        cfg = self._build_vllm_config_with_mamba_flag("llama", "all", has_mamba_layers=True)
+
+        scheduler = RecomputeScheduler(vllm_config=cfg)
+
+        self.assertFalse(scheduler.need_mamba_block_aligned_split)

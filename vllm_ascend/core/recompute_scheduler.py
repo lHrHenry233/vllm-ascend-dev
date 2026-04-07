@@ -126,9 +126,12 @@ class RecomputeScheduler(Scheduler):
             "qwen3_next" in model_type
             or "qwen3_5" in model_type
         )
+        has_mamba_layers = getattr(self, "has_mamba_layers", None)
+        if has_mamba_layers is None:
+            has_mamba_layers = self.is_hybrid_model
         cache_config = getattr(self.vllm_config, "cache_config", None)
         if (
-            self.is_hybrid_model
+            has_mamba_layers
             and cache_config is not None
             and cache_config.enable_prefix_caching
             and cache_config.mamba_cache_mode == "all"
