@@ -1,9 +1,9 @@
 from types import SimpleNamespace
+import unittest
 from unittest.mock import patch
 
 import torch
 
-from tests.ut.base import TestBase
 from vllm_ascend.patch.platform.patch_mamba_config import verify_and_update_config
 
 
@@ -18,7 +18,7 @@ class _FakeModelCls:
         return [torch.float16, torch.float16]
 
 
-class TestPatchMambaConfig(TestBase):
+class TestPatchMambaConfig(unittest.TestCase):
 
     def _build_vllm_config(self, mamba_cache_mode: str):
         cache_config = SimpleNamespace(

@@ -1,7 +1,7 @@
 from types import SimpleNamespace
+import unittest
 from unittest.mock import patch
 
-from tests.ut.base import TestBase
 from vllm_ascend.core.recompute_scheduler import RecomputeScheduler
 
 
@@ -11,7 +11,7 @@ def _fake_scheduler_init(self, *args, **kwargs):
     self.need_mamba_block_aligned_split = True
 
 
-class TestRecomputeSchedulerAllMode(TestBase):
+class TestRecomputeSchedulerAllMode(unittest.TestCase):
 
     def _build_vllm_config(self, model_type: str, mamba_cache_mode: str, enable_prefix_caching: bool = True):
         return SimpleNamespace(
