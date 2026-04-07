@@ -86,8 +86,12 @@ def verify_and_update_config(cls, vllm_config) -> None:
             "exactly equal.",
             mamba_padding_pct,
         )
-    if cache_config.enable_prefix_caching and cache_config.mamba_cache_mode == "align":
-        cache_config.mamba_block_size = cache_config.block_size
+    if cache_config.enable_prefix_caching:
+        # Prefix caching needs block-level mamba states in both align/all modes.
+        if cache_config.mamba_cache_mode in ("align", "all"):
+            cache_config.mamba_block_size = cache_config.block_size
+        else:
+            cache_config.mamba_block_size = model_config.max_model_len
     else:
         cache_config.mamba_block_size = model_config.max_model_len
 
