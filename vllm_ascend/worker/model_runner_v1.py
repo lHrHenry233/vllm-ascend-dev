@@ -113,7 +113,10 @@ from vllm_ascend.patch.worker.patch_module import patch_torch_npu_argsort
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.sample.sampler import AscendSampler
 from vllm_ascend.spec_decode import get_spec_decode_method
-from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
+try:
+    from vllm_ascend.spec_decode.draft_proposer import AscendDraftModelProposer
+except ModuleNotFoundError:
+    AscendDraftModelProposer = None
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
 from vllm_ascend.spec_decode.medusa_proposer import AscendMedusaProposer
 from vllm_ascend.spec_decode.ngram_proposer import AscendNgramProposer
@@ -453,7 +456,6 @@ class NPUModelRunner(GPUModelRunner):
         self.drafter: (
             AscendNgramProposer
             | AscendEagleProposer
-            | AscendDraftModelProposer
             | AscendSuffixDecodingProposer
             | AscendMedusaProposer
             | None
@@ -2258,7 +2260,12 @@ class NPUModelRunner(GPUModelRunner):
             if kv_cache_gid > 0:
                 cm.block_table_tensor, cm.slot_mapping = _get_block_table_and_slot_mapping(kv_cache_gid)
             if self.speculative_config and spec_decode_common_attn_metadata is None:
-                if isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer):
+                draft_proposer_types = (
+                    (AscendEagleProposer, AscendDraftModelProposer)
+                    if AscendDraftModelProposer is not None
+                    else (AscendEagleProposer,)
+                )
+                if isinstance(self.drafter, draft_proposer_types):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
                         spec_decode_common_attn_metadata = cm
                 else:
@@ -2679,7 +2686,12 @@ class NPUModelRunner(GPUModelRunner):
         if self.speculative_config and (
             self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model()
         ):
-            assert isinstance(self.drafter, AscendEagleProposer | AscendDraftModelProposer)
+            draft_proposer_types = (
+                (AscendEagleProposer, AscendDraftModelProposer)
+                if AscendDraftModelProposer is not None
+                else (AscendEagleProposer,)
+            )
+            assert isinstance(self.drafter, draft_proposer_types)
             block_size = (self.kernel_block_sizes[0] if isinstance(
             self.kernel_block_sizes, list) else self.kernel_block_sizes)
             self.drafter.initialize_attn_backend(kv_cache_config, block_size)
@@ -3182,7 +3194,6 @@ class NPUModelRunner(GPUModelRunner):
                     else 0
                 ),
                 kernel_block_sizes=self.kernel_block_sizes,
-                max_num_blocks_per_req=max_num_blocks,
             )
 
     def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:
