@@ -3194,6 +3194,7 @@ class NPUModelRunner(GPUModelRunner):
                     else 0
                 ),
                 kernel_block_sizes=self.kernel_block_sizes,
+                max_num_blocks_per_req=max_num_blocks,
             )
 
     def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:
