@@ -293,7 +293,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             if attn_metadata.num_prefills > 0:
                 initial_state = ssm_state[non_spec_state_indices_tensor].transpose(-1, -2).contiguous()
                 clear_ssm_states(initial_state, has_initial_state)
-                (core_attn_out_non_spec, last_recurrent_state) = chunk_gated_delta_rule(
+                (core_attn_out_non_spec, last_recurrent_state, _) = chunk_gated_delta_rule(
                     q=query_non_spec,
                     k=key_non_spec,
                     v=value_non_spec,
@@ -371,7 +371,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 if attn_metadata.num_prefills > 0:
                     initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
                     clear_ssm_states(initial_state, has_initial_state)
-                    (core_attn_out_non_spec, last_recurrent_state) = chunk_gated_delta_rule(
+                    (core_attn_out_non_spec, last_recurrent_state, _) = chunk_gated_delta_rule(
                         q=query_non_spec,
                         k=key_non_spec,
                         v=value_non_spec,

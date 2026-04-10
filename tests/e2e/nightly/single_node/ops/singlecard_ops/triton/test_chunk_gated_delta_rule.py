@@ -20,6 +20,7 @@ class TestChunkGatedDeltaRule(PytestBase):
         (
             core_attn_out_non_spec,
             last_recurrent_state,
+            _,
         ) = chunk_gated_delta_rule(
             q=q,
             k=k,
