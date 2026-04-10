@@ -547,6 +547,97 @@ def _build_non_spec_chunked_prefill_meta(
     return _build_chunked_prefill_metadata(builder, tensors, slot=slot)
 
 
+def _compute_all_mode_metadata(builder, attn_metadata, m):
+    """Compute all-mode prefix caching metadata and attach to attn_metadata.
+
+    In "all" mode, each sequence may span multiple blocks. We compute:
+    - SOURCE pool slots (where initial state was last written)
+    - DEST pool slots (where final state will be written) — overrides
+      non_spec_state_indices_tensor
+    - Block indices for scatter of intermediate block boundary states
+    - Chunk offsets for mapping FLA h-tensor to block boundaries
+
+    All fields are batch-wide [num_seqs]; forward code slices with
+    [:num_decodes] / [num_decodes:] as needed.
+    """
+    block_size = builder.kv_cache_spec.block_size
+    chunk_size = _GDN_CHUNK_SIZE
+    num_decodes = attn_metadata.num_decodes
+    num_prefills = attn_metadata.num_prefills
+    num_seqs = num_decodes + num_prefills
+    device = m.query_start_loc.device
+
+    if attn_metadata.spec_state_indices_tensor is not None:
+        raise NotImplementedError(
+            "all-mode prefix caching with spec decode not yet supported"
+        )
+
+    # In "all" mode, mamba_get_block_table_tensor returns the full table
+    block_table_2d = m.block_table_tensor[:num_seqs]  # [num_seqs, max_blocks]
+
+    seq_lens = m.seq_lens[:num_seqs]
+    query_lens = (
+        m.query_start_loc[1:num_seqs + 1] - m.query_start_loc[:num_seqs]
+    )
+    context_lens = seq_lens - query_lens
+
+    # DEST block index: last block containing scheduled tokens
+    block_idx_last_scheduled = (seq_lens - 1) // block_size
+    # First block that needs writing (first block with new tokens)
+    block_idx_first_scheduled = context_lens // block_size
+
+    # SOURCE pool slots: block containing the last computed token
+    has_context = context_lens > 0
+    source_block_idx = torch.where(
+        has_context,
+        (context_lens - 1) // block_size,
+        torch.zeros_like(context_lens),  # placeholder for gather
+    )
+    block_state_indices = torch.where(
+        has_context,
+        block_table_2d.gather(
+            1, source_block_idx.unsqueeze(1).long()
+        ).squeeze(1),
+        torch.full((num_seqs,), -1, dtype=block_table_2d.dtype, device=device),
+    )
+
+    # DEST pool slots: block containing the last scheduled token
+    dest_slots = block_table_2d.gather(
+        1, block_idx_last_scheduled.unsqueeze(1).long()
+    ).squeeze(1)
+
+    # Override non_spec_state_indices_tensor:
+    # upstream set it to block_table[:, 0] (block 0), we need DEST block
+    attn_metadata.non_spec_state_indices_tensor = dest_slots
+
+    # Prefill chunk computation for intermediate state scatter
+    # Each decode seq contributes 1 chunk to the FLA h tensor
+    prefill_chunk_start = num_decodes
+    prefill_chunk_offsets = None
+    if num_prefills > 0:
+        prefill_query_lens = query_lens[num_decodes:]
+        prefill_chunk_counts = (
+            (prefill_query_lens + chunk_size - 1) // chunk_size
+        )
+        offsets = torch.zeros(
+            num_prefills + 1, dtype=torch.long, device=device
+        )
+        torch.cumsum(prefill_chunk_counts, dim=0, out=offsets[1:])
+        prefill_chunk_offsets = offsets
+
+    attn_metadata.is_all_mode = True
+    attn_metadata.mamba_block_size = block_size
+    attn_metadata.all_mode_chunk_size = chunk_size
+    attn_metadata.block_table_2d = block_table_2d
+    # SOURCE: pool slot of last-computed block (for reading initial state)
+    attn_metadata.block_state_indices = block_state_indices
+    attn_metadata.block_idx_first_scheduled_token = block_idx_first_scheduled
+    attn_metadata.block_idx_last_scheduled_token = block_idx_last_scheduled
+    attn_metadata.num_computed_tokens_all = context_lens
+    attn_metadata.prefill_chunk_start = prefill_chunk_start
+    attn_metadata.prefill_chunk_offsets = prefill_chunk_offsets
+
+
 def _patched_build(
     self,
     common_prefix_len: int,
@@ -564,6 +655,12 @@ def _patched_build(
         fast_build=fast_build,
     )
     attn_metadata.non_spec_prefill_fallback_meta = None
+    attn_metadata.is_all_mode = False
+
+    mamba_cache_mode = self.vllm_config.cache_config.mamba_cache_mode
+    if mamba_cache_mode == "all":
+        _compute_all_mode_metadata(self, attn_metadata, common_attn_metadata)
+
     if attn_metadata.num_prefills <= 0:
         return attn_metadata
 
