@@ -17,7 +17,13 @@ from dataclasses import dataclass
 
 import torch
 import vllm.v1.attention.backends.gdn_attn as gdn_attn
+from vllm.v1.kv_cache_interface import MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
+
+
+def _tensor_cdiv(a: torch.Tensor, b: int) -> torch.Tensor:
+    """Ceiling division for tensors: -(a // -b)."""
+    return -(a // -b)
 
 _GDN_CHUNK_SIZE = 64
 # Keep this aligned with solve_tril.LARGE_BLOCK_T in ops/triton/fla/solve_tril.py.
@@ -281,6 +287,98 @@ def _build_non_spec_chunked_prefill_meta(builder, cu_seqlens_cpu: torch.Tensor) 
     )
 
 
+def _compute_all_mode_block_indices(
+    common_attn_metadata,
+    block_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute block indices for all-mode prefix caching.
+
+    Returns:
+        block_idx_last_computed_token: cdiv(num_computed, block_size) - 1, clamped >= 0
+        block_idx_first_scheduled_token: cdiv(num_computed + 1, block_size) - 1
+        block_idx_last_scheduled_token: cdiv(seq_lens, block_size) - 1, clamped >= 0
+    """
+    num_computed_tokens = common_attn_metadata.compute_num_computed_tokens()
+
+    block_idx_last_computed_token = torch.clamp(
+        _tensor_cdiv(num_computed_tokens, block_size) - 1, min=0
+    ).to(torch.int32)
+    block_idx_first_scheduled_token = (
+        _tensor_cdiv(num_computed_tokens + 1, block_size) - 1
+    ).to(torch.int32)
+    block_idx_last_scheduled_token = torch.clamp(
+        _tensor_cdiv(common_attn_metadata.seq_lens, block_size) - 1, min=0
+    ).to(torch.int32)
+    return (
+        block_idx_last_computed_token,
+        block_idx_first_scheduled_token,
+        block_idx_last_scheduled_token,
+    )
+
+
+def _apply_all_mode_metadata(
+    attn_metadata,
+    builder,
+    common_attn_metadata,
+    num_decode_draft_tokens_cpu: torch.Tensor | None,
+):
+    """Add all-mode prefix caching fields to GDNAttentionMetadata.
+
+    All fields are batch-wide [batch] tensors. Forward code slices by
+    [:num_decodes] / [num_decodes:] as needed.
+
+    Key naming:
+      - block_state_indices = SOURCE pool slot (read initial state, from last-computed block)
+      - non_spec_state_indices_tensor = DEST pool slot (write final state, overridden to last-scheduled block)
+    """
+    kv_cache_spec = builder.kv_cache_spec
+    assert isinstance(kv_cache_spec, MambaSpec)
+    block_size = kv_cache_spec.block_size
+
+    (
+        block_idx_last_computed_token,
+        block_idx_first_scheduled_token,
+        block_idx_last_scheduled_token,
+    ) = _compute_all_mode_block_indices(common_attn_metadata, block_size)
+
+    block_table_tensor = common_attn_metadata.block_table_tensor
+
+    # --- Core all-mode fields (all batch-wide) ---
+    attn_metadata.is_all_mode = True
+    attn_metadata.mamba_block_size = block_size
+    attn_metadata.all_mode_chunk_size = _GDN_CHUNK_SIZE
+    attn_metadata.block_table_2d = block_table_tensor.to(torch.int32)
+    attn_metadata.block_idx_first_scheduled_token = block_idx_first_scheduled_token
+    attn_metadata.block_idx_last_scheduled_token = block_idx_last_scheduled_token
+    attn_metadata.num_computed_tokens_all = (
+        common_attn_metadata.compute_num_computed_tokens().to(torch.int32)
+    )
+
+    # SOURCE: pool slot to read initial state (= last-computed block's slot)
+    last_computed_idx = block_idx_last_computed_token.to(torch.int64)
+    attn_metadata.block_state_indices = torch.gather(
+        block_table_tensor, 1, last_computed_idx.unsqueeze(1)
+    ).squeeze(1).to(torch.int32)
+
+    # DEST: override non_spec_state_indices_tensor to last-scheduled block's slot
+    spec_sequence_masks_cpu: torch.Tensor | None = None
+    if (
+        num_decode_draft_tokens_cpu is not None
+        and (num_decode_draft_tokens_cpu >= 0).sum().item() > 0
+    ):
+        spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
+
+    if spec_sequence_masks_cpu is None:
+        last_scheduled_idx = block_idx_last_scheduled_token.to(torch.int64)
+        attn_metadata.non_spec_state_indices_tensor = torch.gather(
+            block_table_tensor, 1, last_scheduled_idx.unsqueeze(1)
+        ).squeeze(1).to(torch.int32)
+
+    # Chunk-related fields are set later in _patched_build after chunk meta is built.
+    attn_metadata.prefill_chunk_start = 0
+    attn_metadata.prefill_chunk_offsets = None
+
+
 def _patched_build(
     self,
     common_prefix_len: int,
@@ -297,6 +395,22 @@ def _patched_build(
         num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
         fast_build=fast_build,
     )
+
+    # All-mode prefix caching: override state indices and add block index fields
+    is_all_mode = (
+        hasattr(self, 'vllm_config')
+        and self.vllm_config.cache_config.mamba_cache_mode == "all"
+    )
+    if is_all_mode:
+        _apply_all_mode_metadata(
+            attn_metadata,
+            self,
+            common_attn_metadata,
+            num_decode_draft_tokens_cpu,
+        )
+    else:
+        attn_metadata.is_all_mode = False
+
     attn_metadata.non_spec_chunked_prefill_meta = None
     if attn_metadata.num_prefills <= 0:
         return attn_metadata
@@ -312,6 +426,22 @@ def _patched_build(
     attn_metadata.non_spec_chunked_prefill_meta = _build_non_spec_chunked_prefill_meta(
         self, non_spec_query_start_loc_cpu
     )
+
+    # All-mode: compute chunk-related fields now that chunk meta is available
+    if is_all_mode and attn_metadata.num_prefills > 0:
+        chunk_meta = attn_metadata.non_spec_chunked_prefill_meta
+        num_decodes = attn_metadata.num_decodes
+        # chunk_offsets_chunk64: [num_nonspec_seqs + 1], cumulative chunk counts
+        # prefill_chunk_start = total decode chunks
+        attn_metadata.prefill_chunk_start = int(
+            chunk_meta.chunk_offsets_chunk64[num_decodes].item()
+        )
+        # prefill_chunk_offsets: [num_prefills + 1], 0-based within prefill portion
+        raw_offsets = chunk_meta.chunk_offsets_chunk64[num_decodes:]
+        attn_metadata.prefill_chunk_offsets = (
+            raw_offsets - raw_offsets[0]
+        ).to(torch.int32)
+
     return attn_metadata
 
 
