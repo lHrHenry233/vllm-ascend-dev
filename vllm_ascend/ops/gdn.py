@@ -193,8 +193,11 @@ def _scatter_intermediate_states(
         first_aligned_chunk = first_chunk + chunks_per_block - 1
 
         num_unaligned = num_comp[seq_idx].item() % block_size
-        if num_unaligned > 0:
-            first_aligned_chunk -= num_unaligned // chunk_size
+        assert num_unaligned == 0, (
+            f"Scheduler must guarantee block-aligned context: "
+            f"context_len={num_comp[seq_idx].item()}, "
+            f"block_size={block_size}"
+        )
 
         states = chunk_history[
             first_aligned_chunk:
@@ -385,6 +388,14 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             num_prefills = attn_metadata.num_prefills
 
             if num_prefills > 0:
+                # Compute SOURCE block index for conv state initial state.
+                # Kernel expects block INDEX (not pool slot) into block_table_2d.
+                num_comp = attn_metadata.num_computed_tokens_all
+                initial_state_idx = torch.where(
+                    num_comp > 0,
+                    (num_comp - 1) // attn_metadata.mamba_block_size,
+                    torch.full_like(num_comp, -1),
+                )
                 # Prefill: Triton causal_conv1d_fwd_npu with APC params
                 mixed_qkv_non_spec = causal_conv1d_fwd_npu(
                     x=mixed_qkv_non_spec,
@@ -400,13 +411,20 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         attn_metadata.block_idx_first_scheduled_token),
                     block_idx_last_scheduled_token=(
                         attn_metadata.block_idx_last_scheduled_token),
-                    initial_state_idx=None,
+                    initial_state_idx=initial_state_idx,
                     num_computed_tokens=(
                         attn_metadata.num_computed_tokens_all),
                     block_size_to_align=attn_metadata.mamba_block_size,
                 )
             elif num_decodes > 0:
-                # Decode-only: existing update kernel with APC
+                # Decode-only: pre-copy conv state SOURCE → DEST
+                src_slots = attn_metadata.block_state_indices[:num_decodes]
+                dst_slots = non_spec_state_indices_tensor[:num_decodes]
+                need_copy = (src_slots >= 0) & (dst_slots >= 0) & (
+                    src_slots != dst_slots)
+                if need_copy.any():
+                    conv_state[dst_slots[need_copy].long()] = (
+                        conv_state[src_slots[need_copy].long()])
                 mixed_qkv_non_spec = causal_conv1d_update_npu(
                     mixed_qkv_non_spec,
                     conv_state,
@@ -534,10 +552,17 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         ssm_state, chunk_history, attn_metadata,
                         attn_metadata.num_decodes, transpose_state=True)
             elif is_all_mode and attn_metadata.num_decodes > 0:
-                # All-mode decode-only: simple read SOURCE → recurrent → write DEST
+                # All-mode decode-only: pre-copy SOURCE → DEST, then
+                # in-place recurrent kernel reads/writes via DEST slots.
+                # Qwen3Next: pool [V,K], no transpose needed for pre-copy
+                # (same layout in pool, just different slots)
                 src_slots = attn_metadata.block_state_indices
-                valid_src = src_slots >= 0
-                initial_s = ssm_state[src_slots[valid_src].long()].transpose(-1, -2).contiguous()
+                dst_slots = non_spec_state_indices_tensor
+                need_copy = (src_slots >= 0) & (dst_slots >= 0) & (
+                    src_slots != dst_slots)
+                if need_copy.any():
+                    ssm_state[dst_slots[need_copy].long()] = (
+                        ssm_state[src_slots[need_copy].long()])
                 cu_seqlens = non_spec_query_start_loc[: attn_metadata.num_decodes + 1]
                 actual_seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
                 query_non_spec = l2norm_fwd(query_non_spec)
@@ -662,7 +687,16 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                             ssm_state, chunk_history, attn_metadata,
                             attn_metadata.num_decodes, transpose_state=False)
                 elif is_all_mode and attn_metadata.num_decodes > 0:
-                    # All-mode decode-only: read SOURCE → fused_recurrent → write DEST
+                    # All-mode decode-only: pre-copy SOURCE → DEST, then
+                    # in-place fused_recurrent reads/writes via DEST slots.
+                    # Qwen3.5: pool [K,V], no transpose for pre-copy
+                    src_slots = attn_metadata.block_state_indices
+                    dst_slots = non_spec_state_indices_tensor
+                    need_copy = (src_slots >= 0) & (dst_slots >= 0) & (
+                        src_slots != dst_slots)
+                    if need_copy.any():
+                        ssm_state[dst_slots[need_copy].long()] = (
+                            ssm_state[src_slots[need_copy].long()])
                     core_attn_out_non_spec, last_recurrent_state = (
                         fused_recurrent_gated_delta_rule(
                             q=query_non_spec,
@@ -711,6 +745,15 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     core_attn_out_non_spec, last_recurrent_state = None, None
             elif attn_metadata.num_decodes > 0:
                 core_attn_out_spec = None
+                # All-mode: pre-copy SOURCE → DEST before in-place kernel
+                if is_all_mode:
+                    src_slots = attn_metadata.block_state_indices
+                    dst_slots = non_spec_state_indices_tensor
+                    need_copy = (src_slots >= 0) & (dst_slots >= 0) & (
+                        src_slots != dst_slots)
+                    if need_copy.any():
+                        ssm_state[dst_slots[need_copy].long()] = (
+                            ssm_state[src_slots[need_copy].long()])
                 core_attn_out_non_spec = fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log.contiguous(),
                     dt_bias=self.dt_bias.contiguous(),
