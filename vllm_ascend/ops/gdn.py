@@ -190,7 +190,7 @@ def _scatter_intermediate_states(
 
         # Compute aligned chunk index in h tensor
         first_chunk = prefill_chunk_start + chunk_start
-        first_aligned_chunk = first_chunk + chunks_per_block - 1
+        first_aligned_chunk = first_chunk + chunks_per_block
 
         num_unaligned = num_comp[seq_idx].item() % block_size
         assert num_unaligned == 0, (
@@ -394,7 +394,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 initial_state_idx = torch.where(
                     num_comp > 0,
                     (num_comp - 1) // attn_metadata.mamba_block_size,
-                    torch.full_like(num_comp, -1),
+                    torch.zeros_like(num_comp),  # placeholder; has_initial_state=False skips read
                 )
                 # Prefill: Triton causal_conv1d_fwd_npu with APC params
                 mixed_qkv_non_spec = causal_conv1d_fwd_npu(
@@ -548,8 +548,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     ssm_state, last_recurrent_state, attn_metadata,
                     attn_metadata.num_decodes, transpose_state=True)
                 if chunk_history is not None:
+                    # FLA returns h as [B=1, NT, H, K, V]; squeeze batch dim
                     _scatter_intermediate_states(
-                        ssm_state, chunk_history, attn_metadata,
+                        ssm_state, chunk_history.squeeze(0), attn_metadata,
                         attn_metadata.num_decodes, transpose_state=True)
             elif is_all_mode and attn_metadata.num_decodes > 0:
                 # All-mode decode-only: pre-copy SOURCE → DEST, then
@@ -683,8 +684,9 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                         ssm_state, last_recurrent_state, attn_metadata,
                         attn_metadata.num_decodes, transpose_state=False)
                     if chunk_history is not None:
+                        # FLA returns h as [B=1, NT, H, K, V]; squeeze batch dim
                         _scatter_intermediate_states(
-                            ssm_state, chunk_history, attn_metadata,
+                            ssm_state, chunk_history.squeeze(0), attn_metadata,
                             attn_metadata.num_decodes, transpose_state=False)
                 elif is_all_mode and attn_metadata.num_decodes > 0:
                     # All-mode decode-only: pre-copy SOURCE → DEST, then

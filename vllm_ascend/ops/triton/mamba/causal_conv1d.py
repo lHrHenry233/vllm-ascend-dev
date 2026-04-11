@@ -949,9 +949,19 @@ def _causal_conv1d_fwd_kernel_npu(
                 tl.debug_barrier()
                 new_conv_state = tl.where(mask, conv_state, loaded_x)
 
-                # NOTE: writes to SOURCE-based coord (upstream behavior)
+                # Write to DEST slot (not SOURCE) for all-mode correctness
+                conv_states_output_coord_rare = tl.load(
+                    conv_state_indices_ptr
+                    + idx_seq * stride_cache_indices
+                    + current_last_index
+                ).to(tl.int64)
+                conv_states_dest_base = (
+                    conv_states_ptr
+                    + conv_states_output_coord_rare * stride_conv_state_seq
+                    + (idx_feats * stride_conv_state_dim)
+                )
                 conv_states_ptrs_target = (
-                    conv_states_base
+                    conv_states_dest_base
                     + (idx_tokens_conv * stride_conv_state_tok)[:, None]
                 )
                 mask = (
@@ -975,8 +985,19 @@ def _causal_conv1d_fwd_kernel_npu(
                 )
                 new_conv_state = tl.load(x_ptrs, mask_x, 0.0)
 
+                # Write to DEST slot (not SOURCE) for all-mode correctness
+                conv_states_output_coord_rare2 = tl.load(
+                    conv_state_indices_ptr
+                    + idx_seq * stride_cache_indices
+                    + current_last_index
+                ).to(tl.int64)
+                conv_states_dest_base2 = (
+                    conv_states_ptr
+                    + conv_states_output_coord_rare2 * stride_conv_state_seq
+                    + (idx_feats * stride_conv_state_dim)
+                )
                 conv_states_ptrs_target = (
-                    conv_states_base
+                    conv_states_dest_base2
                     + (idx_tokens_conv * stride_conv_state_tok)[:, None]
                 )
                 mask = (

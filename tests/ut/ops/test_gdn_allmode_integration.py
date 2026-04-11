@@ -92,7 +92,7 @@ def _scatter_intermediate_states(ssm_state, chunk_history, metadata,
         cache_slots = block_table[seq_idx, block_first:block_last]
         valid = cache_slots >= 0
         first_chunk = prefill_chunk_start + chunk_start
-        first_aligned_chunk = first_chunk + chunks_per_block - 1
+        first_aligned_chunk = first_chunk + chunks_per_block
         num_unaligned = num_comp[seq_idx].item() % block_size
         if num_unaligned > 0:
             first_aligned_chunk -= num_unaligned // chunk_size
@@ -235,11 +235,11 @@ class TestSSMFlowQwen3Next:
         # Step 4: Scatter intermediate
         _scatter_intermediate_states(pool, chunk_history, m, 0,
                                      transpose_state=True)
-        # Block 0 (slot 10) gets chunk_history[0] transposed
-        expected_b0 = chunk_history[0].transpose(-1, -2).contiguous()
+        # Block 0 (slot 10) gets chunk_history[1] transposed (h[1]=state after block 0)
+        expected_b0 = chunk_history[1].transpose(-1, -2).contiguous()
         torch.testing.assert_close(pool[10], expected_b0)
-        # Block 1 (slot 11) gets chunk_history[1] transposed
-        expected_b1 = chunk_history[1].transpose(-1, -2).contiguous()
+        # Block 1 (slot 11) gets chunk_history[2] transposed (h[2]=state after block 1)
+        expected_b1 = chunk_history[2].transpose(-1, -2).contiguous()
         torch.testing.assert_close(pool[11], expected_b1)
 
     def test_mixed_batch_decode_plus_prefill(self):
@@ -298,10 +298,11 @@ class TestSSMFlowQwen3Next:
         _scatter_intermediate_states(pool, chunk_history, m, 2,
                                      transpose_state=True)
         # prefill_chunk_start=2, chunk_start=0, first_chunk=2
-        # first_aligned_chunk = 2+1-1 = 2, num_computed=0, no shift
-        # states = chunk_history[2:2+1:1] = chunk_history[2]
+        # first_aligned_chunk = 2+1 = 3 (h[3]=state after block 0 of prefill)
+        # num_computed=0, no shift
+        # states = chunk_history[3:3+1:1] = chunk_history[3]
         # Written to block_table[2(prefill row 0), 0] = slot 20
-        expected_b0 = chunk_history[2].transpose(-1, -2).contiguous()
+        expected_b0 = chunk_history[3].transpose(-1, -2).contiguous()
         torch.testing.assert_close(pool[20], expected_b0)
 
 
@@ -344,7 +345,7 @@ class TestSSMFlowQwen35:
         # Scatter — no transpose
         _scatter_intermediate_states(pool, history, m, 0,
                                      transpose_state=False)
-        torch.testing.assert_close(pool[5], history[0])
+        torch.testing.assert_close(pool[5], history[1])
 
     def test_decode_only_no_scatter(self):
         """Decode-only: read SOURCE, transform, write DEST. No scatter."""

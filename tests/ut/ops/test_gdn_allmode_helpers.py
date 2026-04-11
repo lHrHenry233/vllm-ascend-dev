@@ -90,7 +90,7 @@ def _scatter_intermediate_states(ssm_state, chunk_history, metadata,
         cache_slots = block_table[seq_idx, block_first:block_last]
         valid = cache_slots >= 0
         first_chunk = prefill_chunk_start + chunk_start
-        first_aligned_chunk = first_chunk + chunks_per_block - 1
+        first_aligned_chunk = first_chunk + chunks_per_block
         num_unaligned = num_comp[seq_idx].item() % block_size
         if num_unaligned > 0:
             first_aligned_chunk -= num_unaligned // chunk_size
@@ -339,10 +339,10 @@ class TestScatterIntermediateStates:
 
         # n_blocks = last(1) - first(0) = 1
         # chunks_per_block = 64/64 = 1
-        # first_aligned_chunk = 0 + 1 - 1 = 0 (num_computed=0, no shift)
-        # states = chunk_history[0:0+1*1:1] = chunk_history[0]
+        # first_aligned_chunk = 0 + 1 = 1 (h[1] = state after block 0)
+        # states = chunk_history[1:1+1*1:1] = chunk_history[1]
         # Written to block_table[0, 0] = slot 10
-        torch.testing.assert_close(pool[10], chunk_history[0])
+        torch.testing.assert_close(pool[10], chunk_history[1])
 
     def test_single_prefill_three_blocks_aligned(self):
         """192 tokens, 3 blocks, scatter 2 boundaries (blocks 0, 1)."""
@@ -364,10 +364,10 @@ class TestScatterIntermediateStates:
         _scatter_intermediate_states(
             pool, chunk_history, m, 0, transpose_state=False)
 
-        # n_blocks=2, first_aligned_chunk=0
-        # states = chunk_history[0:2:1] = [chunk_history[0], chunk_history[1]]
-        torch.testing.assert_close(pool[5], chunk_history[0])
-        torch.testing.assert_close(pool[6], chunk_history[1])
+        # n_blocks=2, first_aligned_chunk=1 (h[k] = state after chunks 0..k-1)
+        # states = chunk_history[1:3:1] = [chunk_history[1], chunk_history[2]]
+        torch.testing.assert_close(pool[5], chunk_history[1])
+        torch.testing.assert_close(pool[6], chunk_history[2])
 
     def test_with_decode_offset(self):
         """1 decode + 1 prefill, prefill_chunk_start accounts for decode."""
@@ -395,11 +395,11 @@ class TestScatterIntermediateStates:
 
         # Prefill: n_blocks = 1-0 = 1
         # first_chunk = 1 + 0 = 1 (prefill_chunk_start + offset)
-        # first_aligned_chunk = 1 + 1 - 1 = 1
+        # first_aligned_chunk = 1 + 1 = 2 (h[2] = state after block 0)
         # num_computed=0, no shift
-        # states = chunk_history[1:1+1:1] = chunk_history[1]
+        # states = chunk_history[2:2+1:1] = chunk_history[2]
         # Written to block_table[1(prefill row 0), 0] = slot 9
-        torch.testing.assert_close(pool[9], chunk_history[1])
+        torch.testing.assert_close(pool[9], chunk_history[2])
 
     def test_no_blocks_to_scatter(self):
         """When first==last, n_blocks=0, nothing scattered."""
@@ -442,7 +442,7 @@ class TestScatterIntermediateStates:
         _scatter_intermediate_states(
             pool, chunk_history, m, 0, transpose_state=True)
 
-        expected = chunk_history[0].transpose(-1, -2).contiguous()
+        expected = chunk_history[1].transpose(-1, -2).contiguous()
         torch.testing.assert_close(pool[3], expected)
 
     def test_none_prefill_offsets(self):
@@ -456,20 +456,20 @@ class TestScatterIntermediateStates:
         _scatter_intermediate_states(pool, chunk_history, m, 1)
         torch.testing.assert_close(pool, pool_orig)
 
-    def test_partial_first_block_with_computed_tokens(self):
-        """Partial first block: num_computed=32 (half a block)."""
+    def test_resumed_prefill_with_computed_block(self):
+        """Resumed prefill: num_computed=64 (one full block cached)."""
         pool = torch.zeros(POOL_SIZE, H, K, V)
-        # 32 computed + 96 new = 128 total → blocks 0, 1
+        # 64 computed + 96 new = 160 total → blocks 0(cached), 1, 2
         # New tokens: 96 → 2 chunks (96/64 = 1.5 → ceil=2)
         total_chunks = 2
         chunk_history = torch.randn(total_chunks, H, K, V)
 
-        block_table = torch.tensor([[5, 6, -1, -1]], dtype=torch.int32)
+        block_table = torch.tensor([[5, 6, 7, -1]], dtype=torch.int32)
         m = _make_metadata(
             num_decodes=0, num_prefills=1,
-            source_slots=[5], dest_slots=[6],
-            first_sched=[0], last_sched=[1],  # scatter block 0
-            num_computed=[32],
+            source_slots=[5], dest_slots=[7],
+            first_sched=[1], last_sched=[2],  # scatter block 1 only
+            num_computed=[64],
             block_table=block_table,
             prefill_chunk_offsets=[0, 2],
             prefill_chunk_start=0,
@@ -478,10 +478,12 @@ class TestScatterIntermediateStates:
         _scatter_intermediate_states(
             pool, chunk_history, m, 0, transpose_state=False)
 
-        # chunks_per_block=1, first_chunk=0, first_aligned_chunk=0+1-1=0
-        # num_unaligned = 32 % 64 = 32, 32//64=0 → no shift
-        # states = chunk_history[0:1:1] = chunk_history[0]
-        torch.testing.assert_close(pool[5], chunk_history[0])
+        # chunks_per_block=1, first_chunk=0, first_aligned_chunk=0+1=1
+        # n_blocks = 2-1 = 1
+        # num_computed=64, 64%64=0 → block-aligned, no shift
+        # states = chunk_history[1:2:1] = chunk_history[1]
+        # h[1] = state after chunk 0 = state after block 1
+        torch.testing.assert_close(pool[6], chunk_history[1])
 
 
 if __name__ == "__main__":
