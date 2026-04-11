@@ -10,7 +10,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-
 # ──────────────────────────────────────────────────────────────────
 # Inlined helpers (from gdn.py — avoids importing torch_npu)
 # ──────────────────────────────────────────────────────────────────

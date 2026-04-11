@@ -38,7 +38,7 @@ def _make_common_attn_metadata(
     query_lens: list[int],
     block_table: torch.Tensor | None = None,
     block_size: int = BLOCK_SIZE,
-    device: torch.device = torch.device("cpu"),
+    device: torch.device | None = None,
 ):
     """Create CommonAttentionMetadata-like object.
 
@@ -49,6 +49,8 @@ def _make_common_attn_metadata(
         block_size: Block size for auto-generating block_table.
         device: Tensor device.
     """
+    if device is None:
+        device = torch.device("cpu")
     batch_size = len(seq_lens)
     seq_lens_t = torch.tensor(seq_lens, dtype=torch.int32, device=device)
     query_start_loc = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)

@@ -41,7 +41,6 @@ from vllm_ascend.ops.triton.mamba.causal_conv1d import (
 )
 from vllm_ascend.utils import enable_sp
 
-
 # ──────────────────────────────────────────────────────────────────
 # All-mode prefix caching helpers (P4)
 # ──────────────────────────────────────────────────────────────────

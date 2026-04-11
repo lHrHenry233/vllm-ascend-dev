@@ -136,7 +136,7 @@ def _make_metadata(**kw):
     m.num_computed_tokens_all = torch.tensor(
         kw.get('num_computed', [0] * n), dtype=torch.int32)
     m.prefill_chunk_start = kw.get('prefill_chunk_start', 0)
-    offsets = kw.get('prefill_chunk_offsets', None)
+    offsets = kw.get('prefill_chunk_offsets')
     m.prefill_chunk_offsets = (torch.tensor(offsets, dtype=torch.long)
                                if offsets is not None else None)
     return m
@@ -149,7 +149,6 @@ def mock_chunk_kernel(initial_state, num_chunks):
     - final_state: initial_state + 1.0 (deterministic transform)
     - chunk_history: [total_chunks, H, K, V] with sequential values
     """
-    B = initial_state.shape[0]
     output = torch.zeros(1)  # placeholder
     final_state = initial_state + 1.0
     chunk_history = torch.arange(
@@ -475,9 +474,12 @@ class TestEdgeCases:
         # Prefill 1: 64 tokens, 1 block [16], scatter 0
         # Prefill 2: 192 tokens, 3 blocks [17,18,19], scatter 2
         block_table = torch.full((7, 4), -1, dtype=torch.int32)
-        block_table[4, 0] = 14; block_table[4, 1] = 15
+        block_table[4, 0] = 14
+        block_table[4, 1] = 15
         block_table[5, 0] = 16
-        block_table[6, 0] = 17; block_table[6, 1] = 18; block_table[6, 2] = 19
+        block_table[6, 0] = 17
+        block_table[6, 1] = 18
+        block_table[6, 2] = 19
 
         m = _make_metadata(
             source_slots=[0, 1, 2, 3, 8, 9, 10],

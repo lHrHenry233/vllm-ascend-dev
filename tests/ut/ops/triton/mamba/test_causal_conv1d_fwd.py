@@ -108,14 +108,12 @@ def reference_conv1d_varlen(
         final_states: list of (dim, state_len) tensors per seq
     """
     batch_size = len(query_start_loc) - 1
-    dim = x_flat.shape[1]
     out_flat = torch.zeros_like(x_flat)
     final_states = []
 
     for i in range(batch_size):
         start = query_start_loc[i].item()
         end = query_start_loc[i + 1].item()
-        seqlen = end - start
 
         # (dim, seqlen)
         x_seq = x_flat[start:end].T.unsqueeze(0)  # (1, dim, seqlen)
@@ -433,7 +431,6 @@ class TestAPCBlockBoundaryRef:
     def test_block_boundary_with_initial_state(self):
         """Block boundary state when initial_state is provided."""
         dim = 4
-        block_size = 8
         seqlen = 8  # exactly 1 block
         torch.manual_seed(456)
         x = torch.randn(seqlen, dim)
