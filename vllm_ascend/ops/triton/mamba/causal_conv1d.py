@@ -909,7 +909,6 @@ def _causal_conv1d_fwd_kernel_npu(
                 (idx_tokens_conv < state_len)[:, None]
                 & (idx_feats < dim)[None, :]
             )
-            tl.debug_barrier()
             tl.store(conv_states_ptrs_target, loaded_x, mask)
 
         else:
@@ -946,7 +945,6 @@ def _causal_conv1d_fwd_kernel_npu(
                 )
                 loaded_x = tl.load(x_ptrs, mask_x, 0.0)
 
-                tl.debug_barrier()
                 new_conv_state = tl.where(mask, conv_state, loaded_x)
 
                 # Write to DEST slot (not SOURCE) for all-mode correctness
@@ -1060,7 +1058,6 @@ def _causal_conv1d_fwd_kernel_npu(
                 (idx_tokens_conv < state_len)[:, None]
                 & (idx_feats < dim)[None, :]
             )
-            tl.debug_barrier()
             tl.store(conv_states_ptrs_target, loaded_x, mask)
 
     # ================================================================
