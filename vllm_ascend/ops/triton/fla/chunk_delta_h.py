@@ -211,8 +211,9 @@ def chunk_gated_delta_rule_fwd_h(
         )
     assert K <= 256, "current kernel does not support head dimension larger than 256."
 
-    h = k.new_empty(B, NT, H, K, V,
-                    dtype=state_dtype if state_dtype is not None else k.dtype)
+    # h must use k.dtype (bf16) to match q in chunk_fwd_kernel_o's tl.dot.
+    # state_dtype only controls final_state (for pool compatibility).
+    h = k.new_empty(B, NT, H, K, V, dtype=k.dtype)
     h_update = k.new_empty(B, NT, H, K, K)
     final_state = (k.new_empty(
         N, H, K, V,
