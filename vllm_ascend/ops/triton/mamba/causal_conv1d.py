@@ -872,137 +872,97 @@ def _causal_conv1d_fwd_kernel_npu(
             col2 = tl.zeros((BLOCK_N,), dtype=x_ptr.dtype.element_ty)
 
         # Write final conv_state to DEST pool slot
+        # NPU workaround: use 1D row loop instead of 2D load→store
+        # (2D data flow crashes triton-adapter-opt MLIR lowering)
         if state_len <= seqlen:
             # Common case: copy last state_len tokens from x to DEST
-            idx_tokens_last = (
-                (seqlen - state_len) + tl.arange(0, NP2_STATELEN))
-            x_ptrs = (
-                x_ptr
-                + ((sequence_start_index + idx_tokens_last)
-                   * stride_x_token)[:, None]
-                + (idx_feats * stride_x_dim)[None, :]
-            )
-            mask_x = (
-                (idx_tokens_last >= 0)[:, None]
-                & (idx_tokens_last < seqlen)[:, None]
-                & (idx_feats < dim)[None, :]
-            )
-            loaded_x = tl.load(x_ptrs, mask_x, 0.0)
-            idx_tokens_conv = tl.arange(0, NP2_STATELEN)
-
-            # DEST slot coord
             conv_states_output_coord = tl.load(
                 conv_state_indices_ptr
                 + idx_seq * stride_cache_indices
                 + current_last_index
             ).to(tl.int64)
-
-            conv_states_ptrs_target = (
-                conv_states_ptr
-                + conv_states_output_coord * stride_conv_state_seq
-                + (idx_feats * stride_conv_state_dim)
-            )[None, :] + (
-                idx_tokens_conv * stride_conv_state_tok
-            )[:, None]
-
-            mask = (
-                (idx_tokens_conv < state_len)[:, None]
-                & (idx_feats < dim)[None, :]
-            )
-            tl.store(conv_states_ptrs_target, loaded_x, mask)
+            mask_f_wr = idx_feats < dim
+            for row in range(state_len):
+                src_tok = (seqlen - state_len) + row
+                x_row_ptr = (
+                    x_ptr
+                    + (sequence_start_index + src_tok) * stride_x_token
+                    + idx_feats * stride_x_dim
+                )
+                row_data = tl.load(x_row_ptr, mask_f_wr, 0.0)
+                cs_row_ptr = (
+                    conv_states_ptr
+                    + conv_states_output_coord * stride_conv_state_seq
+                    + idx_feats * stride_conv_state_dim
+                    + row * stride_conv_state_tok
+                )
+                tl.store(cs_row_ptr, row_data, mask_f_wr)
 
         else:
             # Rare case: seqlen < state_len (fewer than 3 new tokens)
             if load_init_state:
-                # Mix old conv_state with new x tokens
-                idx_tokens_conv = tl.arange(0, NP2_STATELEN)
-
-                conv_states_ptrs_source = (
-                    conv_states_ptr
-                    + conv_states_input_coord * stride_conv_state_seq
-                    + (idx_feats * stride_conv_state_dim)[None, :]
-                    + ((idx_tokens_conv + seqlen)
-                       * stride_conv_state_tok)[:, None]
-                )
-                mask = (
-                    (conv_states_input_coord < num_cache_lines)
-                    & ((idx_tokens_conv + seqlen) < state_len)[:, None]
-                    & (idx_feats < dim)[None, :]
-                )
-                conv_state = tl.load(
-                    conv_states_ptrs_source, mask, other=0.0)
-
+                # Mix old conv_state with new x tokens (1D row loop)
                 VAL = state_len - seqlen
-
-                x_ptrs = (
-                    x_base[None, :]
-                    + ((idx_tokens_conv - VAL) * stride_x_token)[:, None]
-                )
-                mask_x = (
-                    (idx_tokens_conv - VAL >= 0)[:, None]
-                    & (idx_tokens_conv - VAL < seqlen)[:, None]
-                    & (idx_feats < dim)[None, :]
-                )
-                loaded_x = tl.load(x_ptrs, mask_x, 0.0)
-
-                new_conv_state = tl.where(mask, conv_state, loaded_x)
-
-                # Write to DEST slot (not SOURCE) for all-mode correctness
                 conv_states_output_coord_rare = tl.load(
                     conv_state_indices_ptr
                     + idx_seq * stride_cache_indices
                     + current_last_index
                 ).to(tl.int64)
-                conv_states_dest_base = (
-                    conv_states_ptr
-                    + conv_states_output_coord_rare * stride_conv_state_seq
-                    + (idx_feats * stride_conv_state_dim)
-                )
-                conv_states_ptrs_target = (
-                    conv_states_dest_base
-                    + (idx_tokens_conv * stride_conv_state_tok)[:, None]
-                )
-                mask = (
-                    (idx_tokens_conv < state_len)[:, None]
-                    & (idx_feats < dim)[None, :]
-                )
-                tl.store(conv_states_ptrs_target, new_conv_state, mask)
+                mask_f_rare = idx_feats < dim
+                pool_valid = conv_states_input_coord < num_cache_lines
+                for row in range(state_len):
+                    # Read from pool (shifted old state) or x (new tokens)
+                    pool_tok = row + seqlen
+                    pool_src = (
+                        conv_states_ptr
+                        + conv_states_input_coord * stride_conv_state_seq
+                        + idx_feats * stride_conv_state_dim
+                        + pool_tok * stride_conv_state_tok
+                    )
+                    pool_data = tl.load(
+                        pool_src,
+                        mask_f_rare & (pool_tok < state_len) & pool_valid,
+                        0.0)
+                    x_tok = row - VAL
+                    x_src = x_base + x_tok * stride_x_token
+                    x_data = tl.load(
+                        x_src,
+                        mask_f_rare & (x_tok >= 0) & (x_tok < seqlen),
+                        0.0)
+                    # Exactly one of pool_data/x_data is non-zero
+                    row_data = pool_data + x_data
+                    cs_dst = (
+                        conv_states_ptr
+                        + conv_states_output_coord_rare * stride_conv_state_seq
+                        + idx_feats * stride_conv_state_dim
+                        + row * stride_conv_state_tok
+                    )
+                    tl.store(cs_dst, row_data, mask_f_rare)
             else:
-                # No initial state, seqlen < state_len: zero-pad + x
-                idx_tokens_conv = tl.arange(0, NP2_STATELEN)
+                # No initial state, seqlen < state_len: zero-pad + x (1D)
                 VAL = state_len - seqlen
-
-                x_ptrs = (
-                    x_base[None, :]
-                    + ((idx_tokens_conv - VAL) * stride_x_token)[:, None]
-                )
-                mask_x = (
-                    (idx_tokens_conv - VAL >= 0)[:, None]
-                    & (idx_tokens_conv - VAL < seqlen)[:, None]
-                    & (idx_feats < dim)[None, :]
-                )
-                new_conv_state = tl.load(x_ptrs, mask_x, 0.0)
-
-                # Write to DEST slot (not SOURCE) for all-mode correctness
                 conv_states_output_coord_rare2 = tl.load(
                     conv_state_indices_ptr
                     + idx_seq * stride_cache_indices
                     + current_last_index
                 ).to(tl.int64)
-                conv_states_dest_base2 = (
-                    conv_states_ptr
-                    + conv_states_output_coord_rare2 * stride_conv_state_seq
-                    + (idx_feats * stride_conv_state_dim)
-                )
-                conv_states_ptrs_target = (
-                    conv_states_dest_base2
-                    + (idx_tokens_conv * stride_conv_state_tok)[:, None]
-                )
-                mask = (
-                    (idx_tokens_conv < state_len)[:, None]
-                    & (idx_feats < dim)[None, :]
-                )
-                tl.store(conv_states_ptrs_target, new_conv_state, mask)
+                mask_f_rare2 = idx_feats < dim
+                for row in range(state_len):
+                    x_tok = row - VAL
+                    x_src = x_base + x_tok * stride_x_token
+                    # Valid only if x_tok in [0, seqlen); else 0.0
+                    row_data = tl.load(
+                        x_src,
+                        mask_f_rare2 & (x_tok >= 0) & (x_tok < seqlen),
+                        0.0)
+                    cs_dst = (
+                        conv_states_ptr
+                        + conv_states_output_coord_rare2
+                        * stride_conv_state_seq
+                        + idx_feats * stride_conv_state_dim
+                        + row * stride_conv_state_tok
+                    )
+                    tl.store(cs_dst, row_data, mask_f_rare2)
 
     else:
         # ================================================================
@@ -1018,47 +978,36 @@ def _causal_conv1d_fwd_kernel_npu(
         col0 = tl.load(
             prior_tokens - 2 * stride_x_token, mask_w, 0.0)
 
-        # APC: write intermediate block boundary conv_state
+        # APC: write intermediate block boundary conv_state (1D row loop)
         if (chunk_offset - 1) < n_block_to_fill:
-            idx_tokens_last = (
+            base_token = (
                 last_full_block_token_index
                 - (n_block_to_fill - chunk_offset) * B_size
                 - state_len
-            ) + tl.arange(0, NP2_STATELEN)
-
-            x_ptrs = (
-                x_ptr
-                + (idx_tokens_last * stride_x_token)[:, None]
-                + (idx_feats * stride_x_dim)[None, :]
             )
-            mask_x = (
-                (idx_tokens_last >= 0)[:, None]
-                & (idx_feats < dim)[None, :]
-            )
-            loaded_x = tl.load(x_ptrs, mask_x, 0.0)
-            idx_tokens_conv = tl.arange(0, NP2_STATELEN)
-
-            # Intermediate block pool slot
             conv_states_output_coord = tl.load(
                 conv_state_indices_ptr
                 + idx_seq * stride_cache_indices
                 + current_first_index
                 + (chunk_offset - 1)
             ).to(tl.int64)
-
-            conv_states_ptrs_target = (
-                conv_states_ptr
-                + conv_states_output_coord * stride_conv_state_seq
-                + (idx_feats * stride_conv_state_dim)
-            )[None, :] + (
-                idx_tokens_conv * stride_conv_state_tok
-            )[:, None]
-
-            mask = (
-                (idx_tokens_conv < state_len)[:, None]
-                & (idx_feats < dim)[None, :]
-            )
-            tl.store(conv_states_ptrs_target, loaded_x, mask)
+            mask_f_inter = idx_feats < dim
+            for row in range(state_len):
+                src_tok = base_token + row
+                x_row_ptr = (
+                    x_ptr
+                    + src_tok * stride_x_token
+                    + idx_feats * stride_x_dim
+                )
+                row_data = tl.load(
+                    x_row_ptr, mask_f_inter & (src_tok >= 0), 0.0)
+                cs_row_ptr = (
+                    conv_states_ptr
+                    + conv_states_output_coord * stride_conv_state_seq
+                    + idx_feats * stride_conv_state_dim
+                    + row * stride_conv_state_tok
+                )
+                tl.store(cs_row_ptr, row_data, mask_f_inter)
 
     # ================================================================
     # Section 3: Compute conv1d output (width=4 unrolled)
