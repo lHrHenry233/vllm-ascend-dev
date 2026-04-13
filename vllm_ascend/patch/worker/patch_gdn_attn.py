@@ -14,9 +14,12 @@
 # limitations under the License.
 
 from dataclasses import dataclass
+import logging
 
 import torch
 import vllm.v1.attention.backends.gdn_attn as gdn_attn
+
+logger = logging.getLogger(__name__)
 
 from vllm_ascend.ops.triton.gdn_chunk_meta import (
     _build_seq_lens,
@@ -636,6 +639,31 @@ def _compute_all_mode_metadata(builder, attn_metadata, m):
     attn_metadata.num_computed_tokens_all = context_lens
     attn_metadata.prefill_chunk_start = prefill_chunk_start
     attn_metadata.prefill_chunk_offsets = prefill_chunk_offsets
+
+    logger.debug(
+        "╔══ ALL-MODE Metadata ═════════════════════\n"
+        "║ block_size=%d  chunk_size=%d\n"
+        "║ num_seqs=%d (decode=%d, prefill=%d)\n"
+        "║ seq_lens=%s\n"
+        "║ context_lens=%s\n"
+        "║ source_slots=%s\n"
+        "║ dest_slots=%s\n"
+        "║ first_scheduled=%s\n"
+        "║ last_scheduled=%s\n"
+        "║ has_initial_state=%s\n"
+        "╚═════════════════════════════════════════",
+        block_size, chunk_size,
+        num_seqs, num_decodes, num_prefills,
+        seq_lens.tolist(),
+        context_lens.tolist(),
+        block_state_indices.tolist(),
+        dest_slots.tolist(),
+        block_idx_first_scheduled.tolist(),
+        block_idx_last_scheduled.tolist(),
+        (attn_metadata.has_initial_state.tolist()
+         if hasattr(attn_metadata, 'has_initial_state')
+         and attn_metadata.has_initial_state is not None else "N/A"),
+    )
 
 
 def _patched_build(
