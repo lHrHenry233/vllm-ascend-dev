@@ -149,7 +149,22 @@ def test_common_case():
 
 
 def test_apc_mode():
-    """Test 2: APC mode — block boundary intermediate states."""
+    """Test 2: APC mode — block boundary intermediate states.
+
+    Layout: 1 seq, seqlen=32, block_size=16 → 2 blocks (block 0, block 1).
+    cache_indices[0] = [slot5, slot6, ...] (block 0→slot5, block 1→slot6)
+    SOURCE (initial_state_idx=0) → cache_indices[0,0] = slot5
+    block_idx_first=0, block_idx_last=1
+    DEST (final state) = cache_indices[0, block_idx_last=1] = slot6
+
+    Intermediate writes (Section 2):
+      n_block_to_fill = last(1) - first(0) = 1
+      chunk_offset=1: cache_indices[0, first + 0] = slot5 (block 0 boundary)
+
+    After kernel:
+      slot5 = intermediate block 0 state = x[13:16] (overwrites SOURCE)
+      slot6 = DEST final state = x[29:32]
+    """
     print("\n--- Test 2: APC mode (seqlen=32, block_size=16) ---")
     B, dim = 1, 64
     seqlen = 32
@@ -159,21 +174,19 @@ def test_apc_mode():
     weight = torch.randn(dim, D_CONV, device=DEVICE, dtype=torch.bfloat16)
     bias = torch.randn(dim, device=DEVICE, dtype=torch.bfloat16)
 
-    pool_size = 8
+    pool_size = 10
     conv_states = torch.zeros(pool_size, dim, STATE_LEN, device=DEVICE, dtype=torch.bfloat16)
 
-    # Initial state in slot 0
+    # Initial state in slot 5 (SOURCE)
     init_state = torch.randn(STATE_LEN, dim, device=DEVICE, dtype=torch.bfloat16)
-    conv_states[0] = init_state.T
+    conv_states[5] = init_state.T
 
     query_start_loc = torch.tensor([0, seqlen], dtype=torch.int32, device=DEVICE)
     has_initial = torch.tensor([1], dtype=torch.int32, device=DEVICE)
 
-    # cache_indices: SOURCE=slot0 (initial_state_idx=0), blocks: slot 2, 3
-    # block_idx_first_scheduled_token=0 (first block to fill)
-    # block_idx_last_scheduled_token=1 (DEST = last block)
-    cache_indices = torch.tensor([[0, 2, 3]], dtype=torch.int32, device=DEVICE)
-    initial_state_idx = torch.tensor([0], dtype=torch.int32, device=DEVICE)
+    # Block table: block 0 → slot 5, block 1 → slot 6
+    cache_indices = torch.tensor([[5, 6]], dtype=torch.int32, device=DEVICE)
+    initial_state_idx = torch.tensor([0], dtype=torch.int32, device=DEVICE)  # SOURCE = cache_indices[0,0] = slot 5
     block_idx_first = torch.tensor([0], dtype=torch.int32, device=DEVICE)
     block_idx_last = torch.tensor([1], dtype=torch.int32, device=DEVICE)
     num_computed = torch.tensor([0], dtype=torch.int32, device=DEVICE)
@@ -199,15 +212,15 @@ def test_apc_mode():
     assert torch.allclose(out_f32, ref_out.to(DEVICE), atol=atol, rtol=rtol), \
         f"APC output mismatch: max_diff={torch.max(torch.abs(out_f32 - ref_out.to(DEVICE))):.6f}"
 
-    # Check intermediate block boundary state (slot 2 = first block boundary)
-    # At block boundary (token 15→16), state should be x[13:16] (last 3 before boundary)
-    boundary_state = conv_states[2]  # (dim, state_len)
+    # Check intermediate block boundary state (slot 5 = block 0, overwritten)
+    # Block 0 boundary: last 3 tokens of block 0 = x[13:16]
+    boundary_state = conv_states[5]  # (dim, state_len)
     expected_boundary = x[block_size - STATE_LEN:block_size].T  # x[13:16].T = (dim, 3)
     assert torch.allclose(boundary_state.float(), expected_boundary.float(), atol=0.01), \
         f"Intermediate state mismatch: max_diff={torch.max(torch.abs(boundary_state.float() - expected_boundary.float())):.6f}"
 
-    # Check final state (slot 3 = DEST = last block)
-    final_state = conv_states[3]
+    # Check final state (slot 6 = DEST = cache_indices[0, block_idx_last=1])
+    final_state = conv_states[6]  # (dim, state_len)
     expected_final = x[-STATE_LEN:].T  # x[29:32].T = (dim, 3)
     assert torch.allclose(final_state.float(), expected_final.float(), atol=0.01), \
         f"Final state mismatch: max_diff={torch.max(torch.abs(final_state.float() - expected_final.float())):.6f}"
@@ -361,6 +374,107 @@ def test_mixed_batch():
     print("✅ Test 5 PASSED: mixed batch (seqlens=[32,8,2]) all correct")
 
 
+def test_apc_multiblock():
+    """Test 2b: APC with 4 blocks, partial first block (num_computed > 0).
+
+    Scenario: seq was previously computed up to token 10 (block 0 partially).
+    Now scheduling tokens 10-63 (54 new tokens), block_size=16.
+
+    Blocks layout (0-indexed):
+      Block 0: tokens 0-15    (already has initial state)
+      Block 1: tokens 16-31
+      Block 2: tokens 32-47
+      Block 3: tokens 48-63
+
+    block_idx_first_scheduled_token = 0  (block 0 still needs final state)
+    block_idx_last_scheduled_token = 3
+    num_computed_tokens = 10
+    initial_state_idx = 0  (SOURCE = block 0's slot, has old partial state)
+    """
+    print("\n--- Test 2b: APC multiblock (seqlen=54, block_size=16, 4 blocks) ---")
+    B, dim = 1, 64
+    seqlen = 54  # tokens 10-63 (num_computed=10 already done)
+    block_size = 16
+
+    x = torch.randn(seqlen, dim, device=DEVICE, dtype=torch.bfloat16)
+    weight = torch.randn(dim, D_CONV, device=DEVICE, dtype=torch.bfloat16)
+    bias = torch.randn(dim, device=DEVICE, dtype=torch.bfloat16)
+
+    pool_size = 10
+    conv_states = torch.zeros(pool_size, dim, STATE_LEN, device=DEVICE, dtype=torch.bfloat16)
+
+    # Initial state in slot 0 (SOURCE — old partial conv state from block 0)
+    init_state = torch.randn(STATE_LEN, dim, device=DEVICE, dtype=torch.bfloat16)
+    conv_states[0] = init_state.T
+
+    query_start_loc = torch.tensor([0, seqlen], dtype=torch.int32, device=DEVICE)
+    has_initial = torch.tensor([1], dtype=torch.int32, device=DEVICE)
+
+    # Block table: block 0→slot0, block 1→slot1, block 2→slot2, block 3→slot3
+    cache_indices = torch.tensor([[0, 1, 2, 3]], dtype=torch.int32, device=DEVICE)
+    initial_state_idx = torch.tensor([0], dtype=torch.int32, device=DEVICE)
+    block_idx_first = torch.tensor([0], dtype=torch.int32, device=DEVICE)
+    block_idx_last = torch.tensor([3], dtype=torch.int32, device=DEVICE)
+    num_computed = torch.tensor([10], dtype=torch.int32, device=DEVICE)
+
+    out = causal_conv1d_fwd_npu(
+        x, weight, bias, conv_states, query_start_loc,
+        cache_indices=cache_indices,
+        has_initial_state=has_initial,
+        activation="silu",
+        pad_slot_id=-1,
+        block_idx_first_scheduled_token=block_idx_first,
+        block_idx_last_scheduled_token=block_idx_last,
+        initial_state_idx=initial_state_idx,
+        num_computed_tokens=num_computed,
+        block_size_to_align=block_size,
+    )
+
+    # Reference output
+    ref_out, _ = reference_conv1d(x, weight, bias, init_state)
+    out_f32 = out.float()
+    atol = 0.05
+    assert torch.allclose(out_f32, ref_out.to(DEVICE), atol=atol), \
+        f"APC multiblock output mismatch: max_diff={torch.max(torch.abs(out_f32 - ref_out.to(DEVICE))):.6f}"
+
+    # Trace APC bookkeeping:
+    # B_size = block_size = 16
+    # sequence_completed_index = 10
+    # sequence_completed_offset_token = 10 % 16 = 10
+    # seq_completed_offset = 16 - 10 = 6
+    # seq_end_offset = (54 - 6) % 16 = 48 % 16 = 0
+    # last_full_block_token_index = 54 - 0 = 54, since seq_end_offset==0: 54 - 16 = 38
+    #
+    # n_block_to_fill = 3 - 0 = 3
+    #
+    # For intermediate writes at chunk_offset c (1-indexed):
+    #   base_token = 38 - (3 - c) * 16 - 3
+    #
+    # chunk_offset=1: base = 38 - 2*16 - 3 = 38 - 32 - 3 = 3  → x[3:6]   slot 0 (block 0)
+    # chunk_offset=2: base = 38 - 1*16 - 3 = 38 - 16 - 3 = 19 → x[19:22]  slot 1 (block 1)
+    # chunk_offset=3: base = 38 - 0*16 - 3 = 38 - 0 - 3 = 35  → x[35:38]  slot 2 (block 2)
+
+    # Check intermediate block states
+    expected_blocks = [
+        (0, 3, 6, "block 0"),    # slot 0, x[3:6]
+        (1, 19, 22, "block 1"),  # slot 1, x[19:22]
+        (2, 35, 38, "block 2"),  # slot 2, x[35:38]
+    ]
+    for slot, start, end, name in expected_blocks:
+        actual = conv_states[slot]
+        expected = x[start:end].T.to(DEVICE)
+        assert torch.allclose(actual.float(), expected.float(), atol=0.01), \
+            f"Intermediate {name} (slot {slot}) mismatch: max_diff={torch.max(torch.abs(actual.float() - expected.float())):.6f}"
+
+    # Check DEST (block 3) = slot 3 = last 3 tokens: x[51:54]
+    final = conv_states[3]
+    expected_final = x[-STATE_LEN:].T.to(DEVICE)
+    assert torch.allclose(final.float(), expected_final.float(), atol=0.01), \
+        f"DEST (slot 3) mismatch: max_diff={torch.max(torch.abs(final.float() - expected_final.float())):.6f}"
+
+    print("✅ Test 2b PASSED: APC multiblock (4 blocks, partial) all states correct")
+
+
 def test_larger_dim():
     """Test 6: Qwen3.5 realistic dim."""
     print("\n--- Test 6: Large dim (dim=1024, seqlen=64) ---")
@@ -408,10 +522,11 @@ def test_larger_dim():
 if __name__ == "__main__":
     test_common_case()
     test_apc_mode()
+    test_apc_multiblock()
     test_rare_case_with_init()
     test_rare_case_no_init()
     test_mixed_batch()
     test_larger_dim()
     print("\n" + "=" * 60)
-    print("ALL 6 CORRECTNESS TESTS PASSED ✅")
+    print("ALL 7 CORRECTNESS TESTS PASSED ✅")
     print("=" * 60)
