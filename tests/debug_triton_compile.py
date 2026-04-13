@@ -239,8 +239,9 @@ def kernel_level4(
     # 2D store back (identity)
     tl.store(ptrs, state, mask=mask_2d)
 
-    # Also do a simple 1D output to prove the kernel ran
-    tl.store(o_ptr + pid * stride_x_token + idx, state[0, :], mask=mask_f)
+    # 1D output: reduce 2D state to 1D via sum over token dim
+    reduced = tl.sum(state, axis=0)  # (BLOCK_N,)
+    tl.store(o_ptr + pid * stride_x_token + idx, reduced, mask=mask_f)
 
 
 def test_level4():
@@ -289,7 +290,8 @@ def kernel_level5(
     mask_2d = (idx_tok < state_len)[:, None] & mask_f[None, :]
     state = tl.load(ptrs, mask=mask_2d, other=0.0)
 
-    tl.store(o_ptr + pid * stride_x_token + idx, state[0, :], mask=mask_f)
+    reduced = tl.sum(state, axis=0)  # (BLOCK_N,)
+    tl.store(o_ptr + pid * stride_x_token + idx, reduced, mask=mask_f)
 
 
 def test_level5():
@@ -436,7 +438,8 @@ def kernel_level7(
     tl.store(cs_ptrs, loaded_x, mask=mask_2d)
 
     # 1D output to verify
-    tl.store(o_ptr + pid * dim + idx, loaded_x[0, :], mask=mask_f)
+    reduced = tl.sum(loaded_x, axis=0)  # (BLOCK_N,)
+    tl.store(o_ptr + pid * dim + idx, reduced, mask=mask_f)
 
 
 def test_level7():
