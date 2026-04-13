@@ -23,6 +23,17 @@ D_CONV = 4
 STATE_LEN = D_CONV - 1  # 3
 
 
+def make_conv_pool(pool_size: int, dim: int, dtype=torch.bfloat16):
+    """Create conv_states pool with dim-contiguous layout.
+
+    Returns shape (N, dim, state_len) but with stride(1)=1.
+    Physical layout is (N, state_len, dim) viewed via transpose.
+    This matches real vLLM mamba cache allocation.
+    """
+    raw = torch.zeros(pool_size, STATE_LEN, dim, device=DEVICE, dtype=dtype)
+    return raw.transpose(1, 2)  # (N, dim, state_len), stride(1)=1
+
+
 def reference_conv1d(x_seq, weight, bias, initial_state=None):
     """Reference causal conv1d using PyTorch ops.
 
@@ -88,7 +99,7 @@ def test_common_case():
     bias = torch.randn(dim, device=DEVICE, dtype=torch.bfloat16)
 
     pool_size = 8
-    conv_states = torch.zeros(pool_size, dim, STATE_LEN, device=DEVICE, dtype=torch.bfloat16)
+    conv_states = make_conv_pool(pool_size, dim)
 
     # Initial states in pool slots 0 and 1
     init_state_0 = torch.randn(STATE_LEN, dim, device=DEVICE, dtype=torch.bfloat16)
@@ -175,7 +186,7 @@ def test_apc_mode():
     bias = torch.randn(dim, device=DEVICE, dtype=torch.bfloat16)
 
     pool_size = 10
-    conv_states = torch.zeros(pool_size, dim, STATE_LEN, device=DEVICE, dtype=torch.bfloat16)
+    conv_states = make_conv_pool(pool_size, dim)
 
     # Initial state in slot 5 (SOURCE)
     init_state = torch.randn(STATE_LEN, dim, device=DEVICE, dtype=torch.bfloat16)
@@ -239,7 +250,7 @@ def test_rare_case_with_init():
     bias = torch.randn(dim, device=DEVICE, dtype=torch.bfloat16)
 
     pool_size = 4
-    conv_states = torch.zeros(pool_size, dim, STATE_LEN, device=DEVICE, dtype=torch.bfloat16)
+    conv_states = make_conv_pool(pool_size, dim)
 
     init_state = torch.randn(STATE_LEN, dim, device=DEVICE, dtype=torch.bfloat16)
     conv_states[0] = init_state.T
@@ -284,7 +295,7 @@ def test_rare_case_no_init():
     bias = torch.randn(dim, device=DEVICE, dtype=torch.bfloat16)
 
     pool_size = 4
-    conv_states = torch.zeros(pool_size, dim, STATE_LEN, device=DEVICE, dtype=torch.bfloat16)
+    conv_states = make_conv_pool(pool_size, dim)
 
     query_start_loc = torch.tensor([0, seqlen], dtype=torch.int32, device=DEVICE)
     has_initial = torch.tensor([0], dtype=torch.int32, device=DEVICE)
@@ -328,7 +339,7 @@ def test_mixed_batch():
     bias = torch.randn(dim, device=DEVICE, dtype=torch.bfloat16)
 
     pool_size = 12
-    conv_states = torch.zeros(pool_size, dim, STATE_LEN, device=DEVICE, dtype=torch.bfloat16)
+    conv_states = make_conv_pool(pool_size, dim)
 
     # Init states
     init_states = [
@@ -401,7 +412,7 @@ def test_apc_multiblock():
     bias = torch.randn(dim, device=DEVICE, dtype=torch.bfloat16)
 
     pool_size = 10
-    conv_states = torch.zeros(pool_size, dim, STATE_LEN, device=DEVICE, dtype=torch.bfloat16)
+    conv_states = make_conv_pool(pool_size, dim)
 
     # Initial state in slot 0 (SOURCE — old partial conv state from block 0)
     init_state = torch.randn(STATE_LEN, dim, device=DEVICE, dtype=torch.bfloat16)
@@ -485,7 +496,7 @@ def test_larger_dim():
     bias = torch.randn(dim, device=DEVICE, dtype=torch.bfloat16)
 
     pool_size = 4
-    conv_states = torch.zeros(pool_size, dim, STATE_LEN, device=DEVICE, dtype=torch.bfloat16)
+    conv_states = make_conv_pool(pool_size, dim)
     init_state = torch.randn(STATE_LEN, dim, device=DEVICE, dtype=torch.bfloat16)
     conv_states[0] = init_state.T
 
