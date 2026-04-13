@@ -21,8 +21,28 @@ def verify_and_update_config(cls, vllm_config) -> None:
     Args:
         vllm_config: vLLM Config
     """
+    cache_config = vllm_config.cache_config
+
+    # Save user-requested mode before calling parent, which may
+    # downgrade "all" -> "align" because upstream model classes
+    # don't declare SupportsMambaPrefixCaching for GDN yet.
+    requested_mamba_cache_mode = cache_config.mamba_cache_mode
+
     # Enable FULL_AND_PIECEWISE by default
     MambaModelConfig.verify_and_update_config(vllm_config)
+
+    # Restore "all" mode on NPU — we implement all-mode prefix caching
+    # for GDN in vllm-ascend even though upstream hasn't merged it yet.
+    if (
+        requested_mamba_cache_mode == "all"
+        and cache_config.enable_prefix_caching
+        and cache_config.mamba_cache_mode == "align"
+    ):
+        cache_config.mamba_cache_mode = "all"
+        logger.info(
+            "Restoring mamba_cache_mode='all' (NPU all-mode prefix "
+            "caching is supported in vllm-ascend)."
+        )
 
     cache_config = vllm_config.cache_config
     model_config = vllm_config.model_config

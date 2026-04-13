@@ -14,7 +14,7 @@ import pytest
 from tests.e2e.conftest import VllmRunner
 from tests.e2e.model_utils import check_outputs_equal
 
-MODEL = "/shared/models/Qwen3.5-0.8B"
+MODEL = "/shared/models/Qwen3.5-0.8B-ms"
 
 # Long shared prefix (markdown table from existing test_prefix_caching.py),
 # with different question suffixes to trigger prefix cache hits.
