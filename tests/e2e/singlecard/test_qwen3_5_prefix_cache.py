@@ -125,7 +125,7 @@ S3_PROMPTS = [S3_PREFIX + _Q_JOHN, S3_PREFIX + _Q_BOB]
 
 # Common VllmRunner kwargs
 _COMMON_KWARGS = dict(
-    model=MODEL,
+    model_name=MODEL,
     tensor_parallel_size=1,
     enforce_eager=True,
     gpu_memory_utilization=0.7,
