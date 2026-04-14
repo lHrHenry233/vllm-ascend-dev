@@ -141,23 +141,10 @@ _COMMON_KWARGS = dict(
 )
 
 
-def _print_scenario_info(name: str, prefix: str, prompts: list[str]) -> None:
-    """Print scenario configuration at test start."""
-    block_size = 1024
-    # Rough token estimate: ~3.5 chars per token for English + markdown table
-    prefix_tokens_est = len(prefix) // 4
-    n_blocks = (prefix_tokens_est + block_size - 1) // block_size
-    n_boundaries = max(0, n_blocks - 1)
+def _print_scenario_info(name: str) -> None:
+    """Print scenario header."""
     print(f"\n{'='*60}")
     print(f"[SCENARIO {name}]")
-    print(f"  prefix chars    = {len(prefix)}")
-    print(f"  prefix tokens   ≈ {prefix_tokens_est} (estimated)")
-    print(f"  prefix blocks   ≈ {n_blocks} (block_size={block_size})")
-    print(f"  scatter boundaries ≈ {n_boundaries}")
-    print(f"  prompt_A chars  = {len(prompts[0])}")
-    print(f"  prompt_B chars  = {len(prompts[1])}")
-    print(f"  R1: prompt_A → compute all, fill cache")
-    print(f"  R2: prompt_B → cache hit (shared prefix)")
     print(f"{'='*60}")
 
 
@@ -212,8 +199,7 @@ def _run_diagnostic_test(
     """
     prompt_a, prompt_b = prompts
 
-    _print_scenario_info(scenario_name, prompts[0].rsplit("Question:", 1)[0],
-                         prompts)
+    _print_scenario_info(scenario_name)
 
     # Enable GDN debug logging for all engine subprocesses
     _enable_gdn_debug_logging()
