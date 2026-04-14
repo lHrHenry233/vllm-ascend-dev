@@ -177,25 +177,24 @@ def _compare_outputs(
     name_a: str,
     name_b: str,
 ) -> bool:
-    """Soft comparison: print match/diff info but never raise."""
+    """Soft comparison: print full text + match/diff conclusion. Never raises."""
     text_a = outputs_a[0][1] if outputs_a else "<empty>"
     text_b = outputs_b[0][1] if outputs_b else "<empty>"
     match = text_a == text_b
     status = "✅ MATCH" if match else "❌ DIFF"
-    print(f"  {status}: {name_a} vs {name_b}")
+    print(f"\n  ── [{label}] {name_a} vs {name_b}: {status} ──")
+    print(f"    [{name_a}] ({len(text_a)} chars):")
+    print(f"      {text_a}")
+    print(f"    [{name_b}] ({len(text_b)} chars):")
+    print(f"      {text_b}")
     if not match:
-        # Show first divergence point
         min_len = min(len(text_a), len(text_b))
         for i in range(min_len):
             if text_a[i] != text_b[i]:
-                print(f"    first diff at char {i}: "
-                      f"'{text_a[max(0,i-5):i+10]}' vs "
-                      f"'{text_b[max(0,i-5):i+10]}'")
+                print(f"    first diff at char {i}")
                 break
         else:
-            print(f"    len diff: {len(text_a)} vs {len(text_b)}")
-        print(f"    [{name_a}] full: {repr(text_a[:200])}")
-        print(f"    [{name_b}] full: {repr(text_b[:200])}")
+            print(f"    same content to char {min_len}, then length differs")
     return match
 
 
@@ -226,20 +225,20 @@ def _run_diagnostic_test(
     with VllmRunner(**_COMMON_KWARGS, mamba_cache_mode="all",
                     max_model_len=max_model_len) as vllm:
         all_r1 = vllm.generate_greedy([prompt_a], MAX_TOKENS)
-        print(f"  all-R1: {repr(all_r1[0][1][:120])}")
+        print(f"  all-R1: {all_r1[0][1]}")
         all_r2 = vllm.generate_greedy([prompt_b], MAX_TOKENS)
-        print(f"  all-R2: {repr(all_r2[0][1][:120])}")
+        print(f"  all-R2: {all_r2[0][1]}")
 
     # === ALIGN-MODE: R1 + R2 ===
     print(f"\n{'─'*60}")
-    print(f"[{scenario_name}] ALIGN-MODE: R1 + R2 (⚠️ multi-block cache hit unreliable)")
+    print(f"[{scenario_name}] ALIGN-MODE: R1 + R2")
     print(f"{'─'*60}")
     with VllmRunner(**_COMMON_KWARGS, mamba_cache_mode="align",
                     max_model_len=max_model_len) as vllm:
         align_r1 = vllm.generate_greedy([prompt_a], MAX_TOKENS)
-        print(f"  align-R1: {repr(align_r1[0][1][:120])}")
+        print(f"  align-R1: {align_r1[0][1]}")
         align_r2 = vllm.generate_greedy([prompt_b], MAX_TOKENS)
-        print(f"  align-R2: {repr(align_r2[0][1][:120])}")
+        print(f"  align-R2: {align_r2[0][1]}")
 
     # === ALL-MODE FRESH: R2 only (no prior cache) ===
     print(f"\n{'─'*60}")
@@ -248,35 +247,36 @@ def _run_diagnostic_test(
     with VllmRunner(**_COMMON_KWARGS, mamba_cache_mode="all",
                     max_model_len=max_model_len) as vllm:
         all_r2_fresh = vllm.generate_greedy([prompt_b], MAX_TOKENS)
-        print(f"  all-R2-fresh: {repr(all_r2_fresh[0][1][:120])}")
+        print(f"  all-R2-fresh: {all_r2_fresh[0][1]}")
 
     # === COMPARISON REPORT ===
     print(f"\n{'='*60}")
     print(f"[{scenario_name}] COMPARISON REPORT")
     print(f"{'='*60}")
 
-    # 1. R1: all vs align (both compute from scratch, should match)
-    _compare_outputs("R1", all_r1, align_r1,
-                     "all-R1", "align-R1")
+    results = {}
+
+    # 1. R1: all vs align (both from scratch, should match)
+    results["R1"] = _compare_outputs("R1", all_r1, align_r1,
+                                     "all-R1", "align-R1")
 
     # 2. R2 cache correctness: all-R2 (cache hit) vs all-R2-fresh (no cache)
-    #    If match → cache read/write is correct
-    _compare_outputs("R2-cache", all_r2, all_r2_fresh,
-                     "all-R2(cache-hit)", "all-R2(fresh)")
+    results["R2-cache"] = _compare_outputs("R2-cache", all_r2, all_r2_fresh,
+                                           "all-R2(hit)", "all-R2(fresh)")
 
-    # 3. R2 all vs align (informational — align may be wrong for multi-block)
-    _compare_outputs("R2-modes", all_r2, align_r2,
-                     "all-R2", "align-R2")
+    # 3. R2 all vs align
+    results["R2-modes"] = _compare_outputs("R2-modes", all_r2, align_r2,
+                                           "all-R2", "align-R2")
 
-    # 4. R2 content check: does the output contain the expected answer?
-    print(f"\n  Content checks:")
-    # prompt_B asks about Zack Blue (age 30) or Bob Brown (age 45)
-    for name, output in [("all-R2", all_r2), ("all-R2-fresh", all_r2_fresh),
-                         ("align-R2", align_r2)]:
-        text = output[0][1] if output else ""
-        has_answer = "30" in text[:20] or "45" in text[:20]
-        print(f"    {name}: starts with '{text[:30]}...' "
-              f"{'✅ contains answer' if has_answer else '⚠️ no answer found'}")
+    # === CONCLUSION ===
+    print(f"\n  {'='*50}")
+    print(f"  CONCLUSION:")
+    for k, v in results.items():
+        tag = "PASS" if v else "FAIL"
+        print(f"    {k}: {tag}")
+    all_pass = all(results.values())
+    print(f"  Overall: {'ALL PASS' if all_pass else 'HAS FAILURES'}")
+    print(f"  {'='*50}")
 
     # Restore env
     os.environ.pop("GDN_DEBUG", None)

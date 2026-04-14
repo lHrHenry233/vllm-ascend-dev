@@ -648,30 +648,28 @@ def _compute_all_mode_metadata(builder, attn_metadata, m):
     attn_metadata.prefill_chunk_start = prefill_chunk_start
     attn_metadata.prefill_chunk_offsets = prefill_chunk_offsets
 
-    _dbg(
-        "╔══ ALL-MODE Metadata ═════════════════════\n"
-        "║ block_size=%d  chunk_size=%d\n"
-        "║ num_seqs=%d (decode=%d, prefill=%d)\n"
-        "║ seq_lens=%s\n"
-        "║ context_lens=%s\n"
-        "║ source_slots=%s\n"
-        "║ dest_slots=%s\n"
-        "║ first_scheduled=%s\n"
-        "║ last_scheduled=%s\n"
-        "║ has_initial_state=%s\n"
-        "╚═════════════════════════════════════════",
-        block_size, chunk_size,
-        num_seqs, num_decodes, num_prefills,
-        seq_lens.tolist(),
-        context_lens.tolist(),
-        block_state_indices.tolist(),
-        dest_slots.tolist(),
-        block_idx_first_scheduled.tolist(),
-        block_idx_last_scheduled.tolist(),
-        (attn_metadata.has_initial_state.tolist()
-         if hasattr(attn_metadata, 'has_initial_state')
-         and attn_metadata.has_initial_state is not None else "N/A"),
-    )
+    # Clean block-level debug: one line per step showing scheduling behavior
+    if _GDN_DEBUG and num_prefills > 0:
+        for si in range(num_prefills):
+            idx = num_decodes + si
+            new_tok = query_lens[idx].item()
+            ctx = context_lens[idx].item()
+            hit = bool(has_context[idx].item())
+            src = block_state_indices[idx].item()
+            dst = dest_slots[idx].item()
+            blk_first = block_idx_first_scheduled[idx].item()
+            blk_last = block_idx_last_scheduled[idx].item()
+            n_scatter = max(0, blk_last - blk_first)
+            scat_slots = block_table_2d[idx, blk_first:blk_last].tolist() if n_scatter > 0 else []
+            print(
+                f"[GDN-ALL] prefill seq{si}: "
+                f"new={new_tok} ctx={ctx} | "
+                f"{'HIT' if hit else 'no-hit'} | "
+                f"src={'slot' + str(src) if src >= 0 else '-'} "
+                f"dest=slot{dst} | "
+                f"scatter={n_scatter}blk{scat_slots}",
+                flush=True,
+            )
 
 
 def _patched_build(

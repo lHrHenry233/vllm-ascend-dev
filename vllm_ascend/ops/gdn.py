@@ -111,21 +111,6 @@ def _build_initial_state(
             no_init = ~has_init[num_decodes:]
             initial[num_decodes:][no_init] = 0
 
-    _dbg(
-        "╔══ _build_initial_state ═══════════════════\n"
-        "║ decode=%d  prefill=%d  transpose=%s\n"
-        "║ source_slots=%s\n"
-        "║ has_initial_state=%s\n"
-        "║ initial_norm=%.6f  nonzero_count=%d/%d\n"
-        "╚══════════════════════════════════════════",
-        num_decodes, num_prefills, transpose_state,
-        source_slots[:num_seqs].tolist(),
-        (metadata.has_initial_state[num_decodes:].tolist()
-         if metadata.has_initial_state is not None else "N/A"),
-        initial.norm().item(),
-        initial.count_nonzero().item(),
-        initial.numel(),
-    )
     return initial
 
 
@@ -168,15 +153,6 @@ def _write_final_states(
                 state = state.transpose(-1, -2).contiguous()
             ssm_state[p_dest[valid].long()] = state
 
-    _dbg(
-        "╔══ _write_final_states ════════════════════\n"
-        "║ dest_slots=%s  transpose=%s\n"
-        "║ final_state_norm=%.6f\n"
-        "╚══════════════════════════════════════════",
-        dest_slots[:num_decodes + num_prefills].tolist(),
-        transpose_state,
-        final_state.norm().item(),
-    )
 
 
 def _scatter_intermediate_states(
@@ -213,23 +189,12 @@ def _scatter_intermediate_states(
     last_sched = metadata.block_idx_last_scheduled_token[num_decodes:]
     num_comp = metadata.num_computed_tokens_all[num_decodes:]
 
-    _dbg(
-        "╔══ _scatter_intermediate_states ═══════════\n"
-        "║ num_prefills=%d  chunks_per_block=%d\n"
-        "║ prefill_chunk_start=%d",
-        num_prefills, chunks_per_block, prefill_chunk_start,
-    )
-
     for seq_idx in range(num_prefills):
         chunk_start = prefill_offsets[seq_idx].item()
         block_first = first_sched[seq_idx].item()
         block_last = last_sched[seq_idx].item()
         n_blocks = block_last - block_first
         if n_blocks <= 0:
-            _dbg(
-                "║ seq[%d]: blocks[%d:%d] → n_blocks=0, skip",
-                seq_idx, block_first, block_last,
-            )
             continue
 
         cache_slots = block_table[seq_idx, block_first:block_last]
@@ -256,13 +221,8 @@ def _scatter_intermediate_states(
         if transpose_state:
             write_states = write_states.transpose(-1, -2).contiguous()
         ssm_state[cache_slots[valid].long()] = write_states
-        _dbg(
-            "║ seq[%d]: blocks[%d:%d] → scatter %d boundaries → slots %s",
-            seq_idx, block_first, block_last, n_blocks,
-            cache_slots[valid].tolist(),
-        )
 
-    _dbg("╚══════════════════════════════════════════")
+    return
 
 
 def to_int64_tuple(tensor: torch.Tensor) -> tuple[int, ...]:
