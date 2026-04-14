@@ -15,11 +15,19 @@
 
 from dataclasses import dataclass
 import logging
+import os
 
 import torch
 import vllm.v1.attention.backends.gdn_attn as gdn_attn
 
 logger = logging.getLogger(__name__)
+_GDN_DEBUG = bool(os.environ.get("GDN_DEBUG", ""))
+
+
+def _dbg(msg: str, *args) -> None:
+    """Print debug message only when GDN_DEBUG env var is set."""
+    if _GDN_DEBUG:
+        print(msg % args if args else msg, flush=True)
 
 from vllm_ascend.ops.triton.gdn_chunk_meta import (
     _build_seq_lens,
@@ -640,7 +648,7 @@ def _compute_all_mode_metadata(builder, attn_metadata, m):
     attn_metadata.prefill_chunk_start = prefill_chunk_start
     attn_metadata.prefill_chunk_offsets = prefill_chunk_offsets
 
-    logger.debug(
+    _dbg(
         "╔══ ALL-MODE Metadata ═════════════════════\n"
         "║ block_size=%d  chunk_size=%d\n"
         "║ num_seqs=%d (decode=%d, prefill=%d)\n"

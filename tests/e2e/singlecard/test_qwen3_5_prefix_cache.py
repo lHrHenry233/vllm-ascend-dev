@@ -162,11 +162,12 @@ def _print_scenario_info(name: str, prefix: str, prompts: list[str]) -> None:
 
 
 def _enable_gdn_debug_logging() -> None:
-    """Enable DEBUG logging for GDN modules via environment variable.
+    """Enable GDN debug prints via GDN_DEBUG environment variable.
 
     Must be called BEFORE creating VllmRunner so the subprocess inherits it.
+    Uses print() directly (bypasses vllm's logging config which filters DEBUG).
     """
-    os.environ["VLLM_LOGGING_LEVEL"] = "DEBUG"
+    os.environ["GDN_DEBUG"] = "1"
 
 
 def _compare_outputs(
@@ -277,8 +278,8 @@ def _run_diagnostic_test(
         print(f"    {name}: starts with '{text[:30]}...' "
               f"{'✅ contains answer' if has_answer else '⚠️ no answer found'}")
 
-    # Restore logging level
-    os.environ.pop("VLLM_LOGGING_LEVEL", None)
+    # Restore env
+    os.environ.pop("GDN_DEBUG", None)
 
 
 # ─── Test functions ───────────────────────────────────────────────────

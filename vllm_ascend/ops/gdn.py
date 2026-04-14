@@ -16,12 +16,20 @@
 #
 
 import logging
+import os
 
 import torch
 import torch_npu
 from einops import rearrange
 
 logger = logging.getLogger(__name__)
+_GDN_DEBUG = bool(os.environ.get("GDN_DEBUG", ""))
+
+
+def _dbg(msg: str, *args) -> None:
+    """Print debug message only when GDN_DEBUG env var is set."""
+    if _GDN_DEBUG:
+        print(msg % args if args else msg, flush=True)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fla.ops import (
     fused_recurrent_gated_delta_rule,
@@ -103,7 +111,7 @@ def _build_initial_state(
             no_init = ~has_init[num_decodes:]
             initial[num_decodes:][no_init] = 0
 
-    logger.debug(
+    _dbg(
         "╔══ _build_initial_state ═══════════════════\n"
         "║ decode=%d  prefill=%d  transpose=%s\n"
         "║ source_slots=%s\n"
@@ -160,7 +168,7 @@ def _write_final_states(
                 state = state.transpose(-1, -2).contiguous()
             ssm_state[p_dest[valid].long()] = state
 
-    logger.debug(
+    _dbg(
         "╔══ _write_final_states ════════════════════\n"
         "║ dest_slots=%s  transpose=%s\n"
         "║ final_state_norm=%.6f\n"
@@ -205,7 +213,7 @@ def _scatter_intermediate_states(
     last_sched = metadata.block_idx_last_scheduled_token[num_decodes:]
     num_comp = metadata.num_computed_tokens_all[num_decodes:]
 
-    logger.debug(
+    _dbg(
         "╔══ _scatter_intermediate_states ═══════════\n"
         "║ num_prefills=%d  chunks_per_block=%d\n"
         "║ prefill_chunk_start=%d",
@@ -218,7 +226,7 @@ def _scatter_intermediate_states(
         block_last = last_sched[seq_idx].item()
         n_blocks = block_last - block_first
         if n_blocks <= 0:
-            logger.debug(
+            _dbg(
                 "║ seq[%d]: blocks[%d:%d] → n_blocks=0, skip",
                 seq_idx, block_first, block_last,
             )
@@ -248,13 +256,13 @@ def _scatter_intermediate_states(
         if transpose_state:
             write_states = write_states.transpose(-1, -2).contiguous()
         ssm_state[cache_slots[valid].long()] = write_states
-        logger.debug(
+        _dbg(
             "║ seq[%d]: blocks[%d:%d] → scatter %d boundaries → slots %s",
             seq_idx, block_first, block_last, n_blocks,
             cache_slots[valid].tolist(),
         )
 
-    logger.debug("╚══════════════════════════════════════════")
+    _dbg("╚══════════════════════════════════════════")
 
 
 def to_int64_tuple(tensor: torch.Tensor) -> tuple[int, ...]:
