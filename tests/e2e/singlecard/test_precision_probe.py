@@ -317,20 +317,17 @@ class LibrarySystem:
             return {"success": False, "error": "Member not found"}
         if not member.can_checkout():
             return {"success": False, "error": "Checkout limit reached"}
-
         book = self.books.get(isbn)
         if book is None:
             return {"success": False, "error": "Book not found"}
         if book.status != BookStatus.AVAILABLE:
             return {"success": False, "error": f"Book status: {book.status.value}"}
-
         max_days = TIER_LIMITS[member.tier]["max_days"]
         book.status = BookStatus.CHECKED_OUT
         book.checked_out_by = member_id
         book.due_date = datetime.now() + timedelta(days=max_days)
         book.total_checkouts += 1
         member.books_checked_out.append(isbn)
-
         self._log_transaction("checkout", member_id=member_id,
                               book_isbn=isbn, due_days=max_days)
         return {"success": True, "due_date": book.due_date.isoformat(),
@@ -340,24 +337,20 @@ class LibrarySystem:
         member = self.members.get(member_id)
         if member is None:
             return {"success": False, "error": "Member not found"}
-
         book = self.books.get(isbn)
         if book is None:
             return {"success": False, "error": "Book not found"}
         if book.checked_out_by != member_id:
             return {"success": False, "error": "Book not checked out by this member"}
-
         fine = 0.0
         if book.is_overdue():
             days = book.days_overdue()
             fine = member.calculate_late_fee(days)
             member.total_fines += fine
-
         book.status = BookStatus.AVAILABLE
         book.checked_out_by = None
         book.due_date = None
         member.books_checked_out.remove(isbn)
-
         self._log_transaction("return", member_id=member_id,
                               book_isbn=isbn, fine=fine)
         return {"success": True, "fine": fine, "total_fines": member.total_fines}
@@ -377,7 +370,8 @@ class LibrarySystem:
             if book.is_overdue() and book.checked_out_by:
                 member = self.members.get(book.checked_out_by)
                 if member:
-                    overdue.append((book, member, book.days_overdue()))
+                    days = (datetime.now() - book.due_date).days
+                    overdue.append((book, member, days))
         return sorted(overdue, key=lambda x: x[2], reverse=True)
 
     def get_popular_books(self, top_n: int = 10) -> list[Book]:
@@ -450,18 +444,24 @@ _COMMON_KWARGS = dict(
     enforce_eager=True,
     gpu_memory_utilization=0.7,
     enable_prefix_caching=True,
-    max_model_len=4096,
+    max_model_len=8192,
 )
 
 
 def _run_single_mode(mode: str, prompts: list[str]) -> list[str]:
-    """Run prompts through one engine instance, return generated texts."""
+    """Run prompts through one engine instance, return GENERATED texts only."""
     kwargs = {**_COMMON_KWARGS}
     if mode == "all":
-        kwargs["additional_config"] = {"mamba_cache_mode": "all"}
+        kwargs["mamba_cache_mode"] = "all"
     with VllmRunner(**kwargs) as runner:
         outputs = runner.generate_greedy(prompts, MAX_TOKENS)
-    return [out[0][1] for out in outputs]
+    # generate_greedy returns (prompt+generated); strip prompt to get only generated
+    results = []
+    for prompt, out in zip(prompts, outputs):
+        full_text = out[1]
+        generated = full_text[len(prompt):] if full_text.startswith(prompt) else full_text
+        results.append(generated)
+    return results
 
 
 def test_precision_probe():
