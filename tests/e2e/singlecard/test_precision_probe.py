@@ -542,7 +542,7 @@ def _run_single_mode(mode: str, prompts: list[str]) -> list[str]:
     if mode == "all":
         kwargs["additional_config"] = {"mamba_cache_mode": "all"}
     with VllmRunner(**kwargs) as runner:
-        outputs = runner.generate(prompts, max_tokens=MAX_TOKENS)
+        outputs = runner.generate_greedy(prompts, MAX_TOKENS)
     return [out[0][1] for out in outputs]
 
 
