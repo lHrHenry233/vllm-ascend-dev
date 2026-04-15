@@ -113,3 +113,22 @@ def verify_and_update_config(cls, vllm_config) -> None:
 
 
 vllm.model_executor.models.config.HybridAttentionMambaModelConfig.verify_and_update_config = verify_and_update_config
+
+
+# Enable block-aligned split for all-mode in upstream Scheduler.
+# BalanceScheduler (NPU DP scheduler) already does this at L49-50,
+# but the default Scheduler only enables it for "align" mode.
+# Without this, scatter writes incorrect intermediate states when
+# the step start position is not aligned to block boundaries.
+from vllm.v1.core.sched.scheduler import Scheduler as _Scheduler
+
+_original_scheduler_init = _Scheduler.__init__
+
+
+def _patched_scheduler_init(self, *args, **kwargs):
+    _original_scheduler_init(self, *args, **kwargs)
+    if self.has_mamba_layers and self.cache_config.mamba_cache_mode == "all":
+        self.need_mamba_block_aligned_split = True
+
+
+_Scheduler.__init__ = _patched_scheduler_init
