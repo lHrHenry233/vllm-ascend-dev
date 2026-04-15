@@ -397,24 +397,6 @@ class LibrarySystem:
             "member_since": member.join_date.isoformat(),
         }
 
-    def generate_report(self) -> dict:
-        total = len(self.books)
-        available = sum(1 for b in self.books.values()
-                        if b.status == BookStatus.AVAILABLE)
-        checked_out = sum(1 for b in self.books.values()
-                          if b.status == BookStatus.CHECKED_OUT)
-        overdue_count = len(self.get_overdue_books())
-        return {
-            "library_name": self.name,
-            "total_books": total,
-            "available": available,
-            "checked_out": checked_out,
-            "overdue": overdue_count,
-            "total_members": len(self.members),
-            "active_members": sum(1 for m in self.members.values()
-                                  if m.is_active),
-        }
-
     def _log_transaction(self, action: str, **kwargs) -> None:
         entry = {
             "id": self._next_transaction_id,
@@ -424,70 +406,6 @@ class LibrarySystem:
         }
         self.transaction_log.append(entry)
         self._next_transaction_id += 1
-
-    def export_catalog(self) -> str:
-        catalog = []
-        for book in sorted(self.books.values(), key=lambda b: b.isbn):
-            catalog.append({
-                "isbn": book.isbn,
-                "title": book.title,
-                "author": book.author,
-                "status": book.status.value,
-                "checkouts": book.total_checkouts,
-                "rating": book.average_rating,
-            })
-        return json.dumps(catalog, indent=2)
-
-    def bulk_import(self, book_data: list[dict]) -> dict:
-        added = 0
-        skipped = 0
-        for entry in book_data:
-            book = Book(
-                isbn=entry["isbn"],
-                title=entry["title"],
-                author=entry["author"],
-                genre=entry.get("genre", "Unknown"),
-                published_year=entry.get("year", 2000),
-                page_count=entry.get("pages", 0),
-            )
-            if self.add_book(book):
-                added += 1
-            else:
-                skipped += 1
-        return {"added": added, "skipped": skipped, "total": len(book_data)}
-
-
-class ReservationQueue:
-    """Manages book reservation waitlists."""
-
-    def __init__(self):
-        self._queues: dict[str, list[str]] = {}
-
-    def reserve(self, isbn: str, member_id: str) -> int:
-        if isbn not in self._queues:
-            self._queues[isbn] = []
-        if member_id in self._queues[isbn]:
-            return self._queues[isbn].index(member_id) + 1
-        self._queues[isbn].append(member_id)
-        return len(self._queues[isbn])
-
-    def cancel(self, isbn: str, member_id: str) -> bool:
-        if isbn in self._queues and member_id in self._queues[isbn]:
-            self._queues[isbn].remove(member_id)
-            return True
-        return False
-
-    def next_in_line(self, isbn: str) -> Optional[str]:
-        if isbn in self._queues and self._queues[isbn]:
-            return self._queues[isbn].pop(0)
-        return None
-
-    def queue_length(self, isbn: str) -> int:
-        return len(self._queues.get(isbn, []))
-
-    def member_reservations(self, member_id: str) -> list[str]:
-        return [isbn for isbn, q in self._queues.items()
-                if member_id in q]
 ```
 
 '''
