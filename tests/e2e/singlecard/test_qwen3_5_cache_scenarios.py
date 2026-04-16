@@ -1022,6 +1022,34 @@ AGENT_TASK_B = (
 AGENT_PROMPT_A = AGENT_API_DOCS + AGENT_TASK_A
 AGENT_PROMPT_B = AGENT_API_DOCS + AGENT_TASK_B
 
+# ─── Agent short prefixes for dead-block exposure tests ────────
+# R1 uses the full AGENT_API_DOCS; R2 uses a truncated version.
+
+# ~2 blocks shared (~2151 tokens): truncate before §11.2 (well past 2 full blocks)
+AGENT_SHORT_2BLOCK = AGENT_API_DOCS[:AGENT_API_DOCS.index("\n### 11.2 List Attachments")]
+
+# ~1 block shared (~1267 tokens): truncate before Section 3 (Comments)
+AGENT_SHORT_1BLOCK = AGENT_API_DOCS[:AGENT_API_DOCS.index("\n## 3. Comments")]
+
+# Questions about content within the truncated portions
+AGENT_SHORT_QUESTION_2BLOCK = (
+    "Task: Using the Search and Notifications APIs documented above, "
+    "write a workflow that: (1) searches for all tasks mentioning 'timeout' "
+    "in project 'proj_abc123', (2) marks all related notifications as read. "
+    "Show both API calls with full request details."
+    "\n\nAPI Calls:\n"
+)
+AGENT_SHORT_QUESTION_1BLOCK = (
+    "Task: Using only the Projects and Tasks APIs documented above, "
+    "list all tasks in project 'proj_abc123' that have status 'in_progress' "
+    "and were created after 2025-01-01. Show the API call with query parameters."
+    "\n\nAPI Call:\n"
+)
+
+# Short R2 prompts (Agent)
+AGENT_SHORT_PROMPT_2BLOCK = AGENT_SHORT_2BLOCK + AGENT_SHORT_QUESTION_2BLOCK
+AGENT_SHORT_PROMPT_1BLOCK = AGENT_SHORT_1BLOCK + AGENT_SHORT_QUESTION_1BLOCK
+
 
 # ════════════════════════════════════════════════════════════════
 #  SCENARIO A — Multi-turn Dialog (~5500 tokens)
@@ -1567,6 +1595,43 @@ DIALOG_FOLLOWUP_B = (
 DIALOG_PROMPT_A = DIALOG_HISTORY + DIALOG_FOLLOWUP_A
 DIALOG_PROMPT_B = DIALOG_HISTORY + DIALOG_FOLLOWUP_B
 
+# ─── Dialog short prefixes for dead-block exposure tests ───────
+# R1 uses the full DIALOG_HISTORY; R2 uses a truncated version.
+
+# ~2 blocks shared (~2080 tokens): truncate before the Phase 1 verification turn
+DIALOG_SHORT_2BLOCK = DIALOG_HISTORY[
+    :DIALOG_HISTORY.index(
+        "**User**: This is great. Actually, before we move on"
+    )
+]
+
+# ~1 block shared (~1507 tokens): truncate before the NACL discovery turn
+DIALOG_SHORT_1BLOCK = DIALOG_HISTORY[
+    :DIALOG_HISTORY.index(
+        "**User**: You nailed it! Someone on the infra team added"
+    )
+]
+
+# Questions about the truncated conversation context
+DIALOG_SHORT_QUESTION_2BLOCK = (
+    "**User**: Based on our investigation so far, what are the top 3 most "
+    "likely root causes of the API service degradation, ranked by probability? "
+    "For each one, tell me what specific evidence we have from the logs and "
+    "diagnostics that supports or contradicts it."
+    "\n\n**Assistant**: "
+)
+DIALOG_SHORT_QUESTION_1BLOCK = (
+    "**User**: Given the pod crash-loop pattern and the database connection "
+    "errors we've seen so far, should I focus on the application layer or "
+    "the infrastructure layer first? What's the most efficient diagnostic "
+    "path from here?"
+    "\n\n**Assistant**: "
+)
+
+# Short R2 prompts (Dialog)
+DIALOG_SHORT_PROMPT_2BLOCK = DIALOG_SHORT_2BLOCK + DIALOG_SHORT_QUESTION_2BLOCK
+DIALOG_SHORT_PROMPT_1BLOCK = DIALOG_SHORT_1BLOCK + DIALOG_SHORT_QUESTION_1BLOCK
+
 
 # ════════════════════════════════════════════════════════════════
 #  Test Infrastructure
@@ -1767,4 +1832,76 @@ def test_dead_block_1block() -> None:
         "DEAD-BLOCK-1",
         SURVEY_PROMPT_A,          # R1: full document
         SHORT_PROMPT_1BLOCK,  # R2: truncated (~1 block shared)
+    )
+
+
+# ─── Dead-Block: Agent API Documentation ──────────────────────
+
+def test_dead_block_agent_2blocks() -> None:
+    """Dead-block test: Agent doc, R2 shares ~2 blocks with R1.
+
+    R1 = full ~3463-token API docs (fills 3+ blocks of cache)
+    R2 = first ~2151 tokens (before §11.2) + different question (~2 blocks shared)
+
+    R2 cache hit: blocks 0, 1 → needs block 1 boundary SSM state
+    All-mode:   block 1 boundary was scattered → correct ✅
+    Align-mode: block 1 = dead block → zero SSM state → degraded ❌
+    """
+    _run_scenario_test(
+        "DEAD-BLOCK-AGENT-2",
+        AGENT_PROMPT_A,               # R1: full API docs
+        AGENT_SHORT_PROMPT_2BLOCK,    # R2: truncated (~2 blocks shared)
+    )
+
+
+def test_dead_block_agent_1block() -> None:
+    """Dead-block test: Agent doc, R2 shares ~1 block with R1.
+
+    R1 = full ~3463-token API docs (fills 3+ blocks of cache)
+    R2 = first ~1267 tokens (before §3) + different question (~1 block shared)
+
+    R2 cache hit: block 0 → needs block 0 boundary SSM state
+    All-mode:   block 0 boundary was scattered → correct ✅
+    Align-mode: block 0 = dead block → zero SSM state → degraded ❌
+    """
+    _run_scenario_test(
+        "DEAD-BLOCK-AGENT-1",
+        AGENT_PROMPT_A,               # R1: full API docs
+        AGENT_SHORT_PROMPT_1BLOCK,    # R2: truncated (~1 block shared)
+    )
+
+
+# ─── Dead-Block: Multi-turn Dialog ────────────────────────────
+
+def test_dead_block_dialog_2blocks() -> None:
+    """Dead-block test: Dialog history, R2 shares ~2 blocks with R1.
+
+    R1 = full ~4288-token dialog (fills 4+ blocks of cache)
+    R2 = first ~2080 tokens (before Phase 1 turn) + different question
+
+    R2 cache hit: blocks 0, 1 → needs block 1 boundary SSM state
+    All-mode:   block 1 boundary was scattered → correct ✅
+    Align-mode: block 1 = dead block → zero SSM state → degraded ❌
+    """
+    _run_scenario_test(
+        "DEAD-BLOCK-DIALOG-2",
+        DIALOG_PROMPT_A,                # R1: full dialog
+        DIALOG_SHORT_PROMPT_2BLOCK,     # R2: truncated (~2 blocks shared)
+    )
+
+
+def test_dead_block_dialog_1block() -> None:
+    """Dead-block test: Dialog history, R2 shares ~1 block with R1.
+
+    R1 = full ~4288-token dialog (fills 4+ blocks of cache)
+    R2 = first ~1507 tokens (before NACL turn) + different question
+
+    R2 cache hit: block 0 → needs block 0 boundary SSM state
+    All-mode:   block 0 boundary was scattered → correct ✅
+    Align-mode: block 0 = dead block → zero SSM state → degraded ❌
+    """
+    _run_scenario_test(
+        "DEAD-BLOCK-DIALOG-1",
+        DIALOG_PROMPT_A,                # R1: full dialog
+        DIALOG_SHORT_PROMPT_1BLOCK,     # R2: truncated (~1 block shared)
     )
