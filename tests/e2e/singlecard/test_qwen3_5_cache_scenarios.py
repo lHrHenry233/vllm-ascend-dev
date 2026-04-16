@@ -6,7 +6,7 @@ Three scenarios test all-mode vs align-mode cache correctness with
 ~5500-token shared prefixes spanning 5+ blocks (block_size=1024).
 
 Scenarios:
-  B (RAG): Research survey paper + analytical questions
+  B (LongText): Research survey paper + analytical questions
   C (Agent): REST API documentation + task prompts
   A (Multi-turn): Technical support dialog + follow-up questions
 
@@ -47,11 +47,11 @@ _COMMON_KWARGS = dict(
 
 
 # ════════════════════════════════════════════════════════════════
-#  SCENARIO B — RAG: Research Survey Paper (~5500 tokens)
+#  SCENARIO B — Long Text: Research Survey Paper (~5500 tokens)
 # ════════════════════════════════════════════════════════════════
 # ruff: noqa: E501
 
-RAG_DOCUMENT = """\
+SURVEY_DOCUMENT = """\
 You are a research assistant specializing in machine learning and systems optimization. Read the following research paper carefully, then answer the question that follows based only on the information presented in the paper.
 
 ---
@@ -257,14 +257,14 @@ Efficient LLM inference is a multi-dimensional optimization problem spanning mod
 [17] Fu, Y., et al. "Break the Sequential Dependency of LLM Inference Using Lookahead Decoding." ICML 2024.
 """
 
-# ─── RAG Questions ─────────────────────────────────────────────
-RAG_QUESTION_A = (
+# ─── Survey Questions ─────────────────────────────────────────────
+SURVEY_QUESTION_A = (
     "Question: According to Table 1 in the paper, which single optimization "
     "method achieved the best latency-to-accuracy trade-off for LLaMA-2-7B, "
     "and what was its speedup and MMLU accuracy? Provide specific numbers."
     "\n\nAnswer: "
 )
-RAG_QUESTION_B = (
+SURVEY_QUESTION_B = (
     "Question: The paper discusses a 'dead block' problem specific to SSM "
     "prefix caching. Explain what causes dead blocks in align mode, how many "
     "blocks out of 5 have valid state according to Table 4, and why all mode "
@@ -272,33 +272,33 @@ RAG_QUESTION_B = (
     "\n\nAnswer: "
 )
 
-RAG_PROMPT_A = RAG_DOCUMENT + RAG_QUESTION_A
-RAG_PROMPT_B = RAG_DOCUMENT + RAG_QUESTION_B
+SURVEY_PROMPT_A = SURVEY_DOCUMENT + SURVEY_QUESTION_A
+SURVEY_PROMPT_B = SURVEY_DOCUMENT + SURVEY_QUESTION_B
 
-# ─── Short RAG prefixes for dead-block exposure tests ─────────
-# R1 uses the full RAG_DOCUMENT; R2 uses a truncated version.
+# ─── Short prefixes for dead-block exposure tests ─────────
+# R1 uses the full SURVEY_DOCUMENT; R2 uses a truncated version.
 # The shared prefix (first N complete blocks) exposes align-mode's
 # inability to read intermediate block boundary SSM states.
 
 # ~2 blocks shared (~2192 tokens): truncate before Section 3
-RAG_SHORT_2BLOCK = RAG_DOCUMENT[:RAG_DOCUMENT.index("\n## 3. Efficient Attention")]
+SHORT_PREFIX_2BLOCK = SURVEY_DOCUMENT[:SURVEY_DOCUMENT.index("\n## 3. Efficient Attention")]
 
 # ~1 block shared (~1047 tokens): truncate after GPTQ paragraph
-RAG_SHORT_1BLOCK = RAG_DOCUMENT[
-    :RAG_DOCUMENT.index(
+SHORT_PREFIX_1BLOCK = SURVEY_DOCUMENT[
+    :SURVEY_DOCUMENT.index(
         "leaving activations in full precision during computation."
     ) + len("leaving activations in full precision during computation.")
 ]
 
 # Questions for short prefixes (about content within the truncated portion)
-RAG_SHORT_QUESTION_2BLOCK = (
+SHORT_QUESTION_2BLOCK = (
     "Question: Based on the paper's discussion of model compression in "
     "Section 2, compare the three categories of compression techniques "
     "(quantization, pruning, knowledge distillation). Which approach "
     "preserves the most accuracy for LLaMA-2-7B and why?"
     "\n\nAnswer: "
 )
-RAG_SHORT_QUESTION_1BLOCK = (
+SHORT_QUESTION_1BLOCK = (
     "Question: The paper discusses quantization methods in Section 2.1. "
     "Compare GPTQ and AWQ approaches — what is GPTQ's key limitation "
     "that AWQ addresses, and what specific accuracy numbers does the "
@@ -307,8 +307,8 @@ RAG_SHORT_QUESTION_1BLOCK = (
 )
 
 # Short R2 prompts
-RAG_SHORT_PROMPT_2BLOCK = RAG_SHORT_2BLOCK + RAG_SHORT_QUESTION_2BLOCK
-RAG_SHORT_PROMPT_1BLOCK = RAG_SHORT_1BLOCK + RAG_SHORT_QUESTION_1BLOCK
+SHORT_PROMPT_2BLOCK = SHORT_PREFIX_2BLOCK + SHORT_QUESTION_2BLOCK
+SHORT_PROMPT_1BLOCK = SHORT_PREFIX_1BLOCK + SHORT_QUESTION_1BLOCK
 
 
 # ════════════════════════════════════════════════════════════════
@@ -1690,13 +1690,13 @@ def _run_scenario_test(
 #  Test Functions
 # ════════════════════════════════════════════════════════════════
 
-def test_cache_hit_rag() -> None:
-    """Scenario B: RAG — research paper prefix + analytical questions.
+def test_cache_hit_long_text() -> None:
+    """Scenario B: Long text — research paper prefix + analytical questions.
 
     ~5500-token survey paper as shared prefix, two different analytical
     questions as suffixes. Tests multi-block (5+) cache hit correctness.
     """
-    _run_scenario_test("B-RAG", RAG_PROMPT_A, RAG_PROMPT_B)
+    _run_scenario_test("B-LongText", SURVEY_PROMPT_A, SURVEY_PROMPT_B)
 
 
 def test_cache_hit_agent() -> None:
@@ -1722,7 +1722,7 @@ def test_cache_hit_dialog() -> None:
 # ════════════════════════════════════════════════════════════════
 #
 # These tests expose align-mode's "dead block" problem:
-#   R1: full 5500-token RAG document (fills cache, multiple blocks)
+#   R1: full 5500-token survey document (fills cache, multiple blocks)
 #   R2: truncated document (~1-2 blocks shared with R1)
 #
 # When R2 gets a cache hit for 1-2 blocks, it needs the SSM state
@@ -1739,7 +1739,7 @@ def test_cache_hit_dialog() -> None:
 def test_dead_block_2blocks() -> None:
     """Dead-block test: R2 shares ~2 blocks with R1.
 
-    R1 = full 5500-token RAG paper (fills 5+ blocks of cache)
+    R1 = full 5500-token survey paper (fills 5+ blocks of cache)
     R2 = first ~2192 tokens of paper + different question (~2 blocks shared)
 
     R2 cache hit: blocks 0, 1 → needs block 1 boundary SSM state
@@ -1748,15 +1748,15 @@ def test_dead_block_2blocks() -> None:
     """
     _run_scenario_test(
         "DEAD-BLOCK-2",
-        RAG_PROMPT_A,          # R1: full document
-        RAG_SHORT_PROMPT_2BLOCK,  # R2: truncated (~2 blocks shared)
+        SURVEY_PROMPT_A,          # R1: full document
+        SHORT_PROMPT_2BLOCK,  # R2: truncated (~2 blocks shared)
     )
 
 
 def test_dead_block_1block() -> None:
     """Dead-block test: R2 shares ~1 block with R1.
 
-    R1 = full 5500-token RAG paper (fills 5+ blocks of cache)
+    R1 = full 5500-token survey paper (fills 5+ blocks of cache)
     R2 = first ~1047 tokens of paper + different question (~1 block shared)
 
     R2 cache hit: block 0 → needs block 0 boundary SSM state
@@ -1765,6 +1765,6 @@ def test_dead_block_1block() -> None:
     """
     _run_scenario_test(
         "DEAD-BLOCK-1",
-        RAG_PROMPT_A,          # R1: full document
-        RAG_SHORT_PROMPT_1BLOCK,  # R2: truncated (~1 block shared)
+        SURVEY_PROMPT_A,          # R1: full document
+        SHORT_PROMPT_1BLOCK,  # R2: truncated (~1 block shared)
     )
