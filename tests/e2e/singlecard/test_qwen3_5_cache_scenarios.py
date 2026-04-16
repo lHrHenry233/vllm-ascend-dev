@@ -275,6 +275,41 @@ RAG_QUESTION_B = (
 RAG_PROMPT_A = RAG_DOCUMENT + RAG_QUESTION_A
 RAG_PROMPT_B = RAG_DOCUMENT + RAG_QUESTION_B
 
+# ─── Short RAG prefixes for dead-block exposure tests ─────────
+# R1 uses the full RAG_DOCUMENT; R2 uses a truncated version.
+# The shared prefix (first N complete blocks) exposes align-mode's
+# inability to read intermediate block boundary SSM states.
+
+# ~2 blocks shared (~2192 tokens): truncate before Section 3
+RAG_SHORT_2BLOCK = RAG_DOCUMENT[:RAG_DOCUMENT.index("\n## 3. Efficient Attention")]
+
+# ~1 block shared (~1047 tokens): truncate after GPTQ paragraph
+RAG_SHORT_1BLOCK = RAG_DOCUMENT[
+    :RAG_DOCUMENT.index(
+        "leaving activations in full precision during computation."
+    ) + len("leaving activations in full precision during computation.")
+]
+
+# Questions for short prefixes (about content within the truncated portion)
+RAG_SHORT_QUESTION_2BLOCK = (
+    "Question: Based on the paper's discussion of model compression in "
+    "Section 2, compare the three categories of compression techniques "
+    "(quantization, pruning, knowledge distillation). Which approach "
+    "preserves the most accuracy for LLaMA-2-7B and why?"
+    "\n\nAnswer: "
+)
+RAG_SHORT_QUESTION_1BLOCK = (
+    "Question: The paper discusses quantization methods in Section 2.1. "
+    "Compare GPTQ and AWQ approaches — what is GPTQ's key limitation "
+    "that AWQ addresses, and what specific accuracy numbers does the "
+    "paper report for INT4 quantization on MMLU?"
+    "\n\nAnswer: "
+)
+
+# Short R2 prompts
+RAG_SHORT_PROMPT_2BLOCK = RAG_SHORT_2BLOCK + RAG_SHORT_QUESTION_2BLOCK
+RAG_SHORT_PROMPT_1BLOCK = RAG_SHORT_1BLOCK + RAG_SHORT_QUESTION_1BLOCK
+
 
 # ════════════════════════════════════════════════════════════════
 #  SCENARIO C — Agent: REST API Documentation (~5500 tokens)
@@ -1588,11 +1623,20 @@ def _run_scenario_test(
     """
     _enable_gdn_debug_logging()
 
+    # Compute shared prefix length (common leading characters)
+    shared_len = 0
+    for a, b in zip(prompt_a, prompt_b):
+        if a != b:
+            break
+        shared_len += 1
+
     print(f"\n{'='*60}")
     print(f"[{scenario_name}] all-mode vs align-mode cache hit demo")
     print(f"  max_model_len=8192, max_num_batched_tokens=4096")
     print(f"  prompt_a: {len(prompt_a)} chars")
     print(f"  prompt_b: {len(prompt_b)} chars")
+    print(f"  shared prefix: {shared_len} chars "
+          f"({shared_len*100//max(len(prompt_a),1)}% of prompt_a)")
     print(f"{'='*60}")
 
     # === ALL-MODE: R1 (fill cache) + R2 (cache HIT) ===
@@ -1671,3 +1715,56 @@ def test_cache_hit_dialog() -> None:
     follow-up questions as suffixes. Tests cache hit with conversational content.
     """
     _run_scenario_test("A-Dialog", DIALOG_PROMPT_A, DIALOG_PROMPT_B)
+
+
+# ════════════════════════════════════════════════════════════════
+#  Dead-Block Exposure Tests (short R2, 1-2 block cache hit)
+# ════════════════════════════════════════════════════════════════
+#
+# These tests expose align-mode's "dead block" problem:
+#   R1: full 5500-token RAG document (fills cache, multiple blocks)
+#   R2: truncated document (~1-2 blocks shared with R1)
+#
+# When R2 gets a cache hit for 1-2 blocks, it needs the SSM state
+# at the last cached block's boundary. In align-mode, intermediate
+# block boundaries are dead (no SSM state stored) — only the running
+# block has state. All-mode scatters intermediate states, so R2 can
+# correctly resume from any block boundary.
+#
+# Expected behavior:
+#   all-R2:   correct output (reads scattered block boundary state)
+#   align-R2: degraded output (starts from zero SSM state → dead block)
+
+
+def test_dead_block_2blocks() -> None:
+    """Dead-block test: R2 shares ~2 blocks with R1.
+
+    R1 = full 5500-token RAG paper (fills 5+ blocks of cache)
+    R2 = first ~2192 tokens of paper + different question (~2 blocks shared)
+
+    R2 cache hit: blocks 0, 1 → needs block 1 boundary SSM state
+    All-mode:   block 1 boundary was scattered → correct ✅
+    Align-mode: block 1 = dead block → zero SSM state → degraded ❌
+    """
+    _run_scenario_test(
+        "DEAD-BLOCK-2",
+        RAG_PROMPT_A,          # R1: full document
+        RAG_SHORT_PROMPT_2BLOCK,  # R2: truncated (~2 blocks shared)
+    )
+
+
+def test_dead_block_1block() -> None:
+    """Dead-block test: R2 shares ~1 block with R1.
+
+    R1 = full 5500-token RAG paper (fills 5+ blocks of cache)
+    R2 = first ~1047 tokens of paper + different question (~1 block shared)
+
+    R2 cache hit: block 0 → needs block 0 boundary SSM state
+    All-mode:   block 0 boundary was scattered → correct ✅
+    Align-mode: block 0 = dead block → zero SSM state → degraded ❌
+    """
+    _run_scenario_test(
+        "DEAD-BLOCK-1",
+        RAG_PROMPT_A,          # R1: full document
+        RAG_SHORT_PROMPT_1BLOCK,  # R2: truncated (~1 block shared)
+    )
