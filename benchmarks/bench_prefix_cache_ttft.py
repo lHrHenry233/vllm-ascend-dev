@@ -90,7 +90,7 @@ def run_benchmark(
     llm = LLM(
         model=MODEL,
         **ENGINE_KWARGS,
-        additional_config={"mamba_cache_mode": mode},
+        mamba_cache_mode=mode,
     )
     sampling_params = SamplingParams(temperature=0, max_tokens=max_tokens)
 
