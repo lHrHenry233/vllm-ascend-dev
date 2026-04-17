@@ -34,25 +34,40 @@ import sys
 import time
 
 # ────────────────────────────────────────────────────────────
-# Prompt data (Survey scenario, ~2500 tokens prefix)
+# Prompt data — import all scenarios from the test file
 # ────────────────────────────────────────────────────────────
-# We import from the test file to reuse the exact same prompts.
-# If running standalone, fall back to inline prompt.
-try:
-    sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-    from tests.e2e.singlecard.test_qwen3_5_cache_scenarios import (
-        SURVEY_DOCUMENT,
-        SURVEY_QUESTION_A,
-        SURVEY_QUESTION_B,
-    )
-except ImportError:
-    print("WARNING: Could not import test prompts. Using inline placeholder.")
-    SURVEY_DOCUMENT = "This is a placeholder prefix. " * 500
-    SURVEY_QUESTION_A = "\n\nQuestion: What is the main topic?\n\nAnswer: "
-    SURVEY_QUESTION_B = "\n\nQuestion: What are the conclusions?\n\nAnswer: "
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-PROMPT_A = SURVEY_DOCUMENT + SURVEY_QUESTION_A
-PROMPT_B = SURVEY_DOCUMENT + SURVEY_QUESTION_B
+_SCENARIOS = {}
+
+try:
+    from tests.e2e.singlecard.test_qwen3_5_cache_scenarios import (
+        SURVEY_DOCUMENT, SURVEY_QUESTION_A, SURVEY_QUESTION_B,
+        AGENT_PROMPT_A, AGENT_PROMPT_B,
+        DIALOG_PROMPT_A, DIALOG_PROMPT_B,
+    )
+    _SCENARIOS["survey"] = {
+        "desc": "Research survey paper (~5500 tokens prefix, 5+ blocks)",
+        "prompt_a": SURVEY_DOCUMENT + SURVEY_QUESTION_A,
+        "prompt_b": SURVEY_DOCUMENT + SURVEY_QUESTION_B,
+    }
+    _SCENARIOS["agent"] = {
+        "desc": "REST API documentation (~3500 tokens prefix, 3+ blocks)",
+        "prompt_a": AGENT_PROMPT_A,
+        "prompt_b": AGENT_PROMPT_B,
+    }
+    _SCENARIOS["dialog"] = {
+        "desc": "Technical support dialog (~4300 tokens prefix, 4+ blocks)",
+        "prompt_a": DIALOG_PROMPT_A,
+        "prompt_b": DIALOG_PROMPT_B,
+    }
+except ImportError as e:
+    print(f"WARNING: Could not import test prompts ({e}). Only 'placeholder' available.")
+    _SCENARIOS["placeholder"] = {
+        "desc": "Placeholder prefix (not real content)",
+        "prompt_a": "This is a placeholder prefix. " * 500 + "\n\nQ: topic?\nA: ",
+        "prompt_b": "This is a placeholder prefix. " * 500 + "\n\nQ: conclusions?\nA: ",
+    }
 
 MODEL = "/shared/models/Qwen3.5-0.8B-ms"
 
@@ -71,6 +86,9 @@ ENGINE_KWARGS = dict(
 
 def run_benchmark(
     mode: str,
+    prompt_a: str,
+    prompt_b: str,
+    scenario_name: str = "survey",
     num_iters: int = 5,
     max_tokens: int = 10,
     skip_warmup: bool = False,
@@ -82,7 +100,8 @@ def run_benchmark(
     from vllm import LLM, SamplingParams
 
     print(f"\n{'='*60}")
-    print(f"  MODE: {mode}")
+    print(f"  MODE: {mode}  |  SCENARIO: {scenario_name}")
+    print(f"  Prompt prefix: {len(prompt_a)} chars → {len(prompt_b)} chars")
     print(f"  Iterations: {num_iters}, max_tokens: {max_tokens}")
     print(f"  GDN_ALIGN_TRITON_CONV1D={os.environ.get('GDN_ALIGN_TRITON_CONV1D', '(not set)')}")
     print(f"{'='*60}")
@@ -101,7 +120,7 @@ def run_benchmark(
         if not skip_warmup or i == 0:
             # R1: Fill cache with prompt_A
             t0 = time.perf_counter()
-            r1_out = llm.generate([PROMPT_A], sampling_params)
+            r1_out = llm.generate([prompt_a], sampling_params)
             t1 = time.perf_counter()
             r1_ms = (t1 - t0) * 1000
             r1_times.append(r1_ms)
@@ -112,7 +131,7 @@ def run_benchmark(
 
         # R2: Cache hit with prompt_B (same prefix, different question)
         t2 = time.perf_counter()
-        r2_out = llm.generate([PROMPT_B], sampling_params)
+        r2_out = llm.generate([prompt_b], sampling_params)
         t3 = time.perf_counter()
         r2_ms = (t3 - t2) * 1000
         r2_times.append(r2_ms)
@@ -184,6 +203,7 @@ def print_comparison(all_result: dict, align_result: dict):
 
 
 def main():
+    available = list(_SCENARIOS.keys())
     parser = argparse.ArgumentParser(
         description="Layer 1 Micro Benchmark: all-mode vs align-mode R2 TTFT")
     parser.add_argument("--num-iters", type=int, default=5,
@@ -194,30 +214,48 @@ def main():
                         help="Only run R1 on first iteration (reuse cache)")
     parser.add_argument("--mode", choices=["all", "align", "both"], default="both",
                         help="Which mode(s) to benchmark (default: both)")
+    parser.add_argument("--scenario", choices=available + ["all"],
+                        default=available[0],
+                        help=f"Prompt scenario (default: {available[0]})")
     args = parser.parse_args()
 
-    print(f"Model: {MODEL}")
-    print(f"Prefix: Survey document (~2500 tokens, ~3 blocks @ block_size=1024)")
-    print(f"max_tokens={args.max_tokens}, num_iters={args.num_iters}")
+    # Resolve scenarios to run
+    if args.scenario == "all":
+        scenarios = available
+    else:
+        scenarios = [args.scenario]
 
-    results = {}
+    for scenario_name in scenarios:
+        sc = _SCENARIOS[scenario_name]
+        prompt_a = sc["prompt_a"]
+        prompt_b = sc["prompt_b"]
 
-    if args.mode in ("all", "both"):
-        results["all"] = run_benchmark(
-            "all", args.num_iters, args.max_tokens, args.skip_warmup)
+        print(f"\n{'#'*70}")
+        print(f"# SCENARIO: {scenario_name}")
+        print(f"# {sc['desc']}")
+        print(f"# prompt_a: {len(prompt_a)} chars, prompt_b: {len(prompt_b)} chars")
+        print(f"{'#'*70}")
 
-    if args.mode in ("align", "both"):
-        results["align"] = run_benchmark(
-            "align", args.num_iters, args.max_tokens, args.skip_warmup)
+        results = {}
 
-    if "all" in results and "align" in results:
-        print_comparison(results["all"], results["align"])
-    elif len(results) == 1:
-        mode, r = next(iter(results.items()))
-        print(f"\n{'='*60}")
-        print(f"  {mode}-mode R2 mean: {r['r2_mean_ms']:.1f}ms "
-              f"(median: {r['r2_median_ms']:.1f}ms)")
-        print(f"{'='*60}")
+        if args.mode in ("all", "both"):
+            results["all"] = run_benchmark(
+                "all", prompt_a, prompt_b, scenario_name,
+                args.num_iters, args.max_tokens, args.skip_warmup)
+
+        if args.mode in ("align", "both"):
+            results["align"] = run_benchmark(
+                "align", prompt_a, prompt_b, scenario_name,
+                args.num_iters, args.max_tokens, args.skip_warmup)
+
+        if "all" in results and "align" in results:
+            print_comparison(results["all"], results["align"])
+        elif len(results) == 1:
+            mode, r = next(iter(results.items()))
+            print(f"\n{'='*60}")
+            print(f"  {mode}-mode R2 mean: {r['r2_mean_ms']:.1f}ms "
+                  f"(median: {r['r2_median_ms']:.1f}ms)")
+            print(f"{'='*60}")
 
 
 if __name__ == "__main__":
