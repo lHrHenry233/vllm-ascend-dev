@@ -55,8 +55,9 @@ import urllib.request
 
 # ── Configuration ──────────────────────────────────────────────────────
 
+_HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
 SHAREGPT_URL = (
-    "https://huggingface.co/datasets/anon8231489123/"
+    f"{_HF_ENDPOINT}/datasets/anon8231489123/"
     "ShareGPT_Vicuna_unfiltered/resolve/main/"
     "ShareGPT_V3_unfiltered_cleaned_split.json"
 )
@@ -499,7 +500,20 @@ def main():
     parser.add_argument(
         "--dry-run", action="store_true",
         help="Only construct prompts and print stats (no engine)")
+    parser.add_argument(
+        "--hf-mirror", type=str, default=None,
+        help="HuggingFace mirror URL (e.g. https://hf-mirror.com)")
     args = parser.parse_args()
+
+    # Apply mirror if specified via CLI (overrides HF_ENDPOINT env var)
+    if args.hf_mirror:
+        global SHAREGPT_URL, _HF_ENDPOINT
+        _HF_ENDPOINT = args.hf_mirror.rstrip("/")
+        SHAREGPT_URL = (
+            f"{_HF_ENDPOINT}/datasets/anon8231489123/"
+            "ShareGPT_Vicuna_unfiltered/resolve/main/"
+            "ShareGPT_V3_unfiltered_cleaned_split.json"
+        )
 
     model_path = args.model
     max_gen_tokens = args.max_tokens
