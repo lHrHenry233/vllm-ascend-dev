@@ -317,7 +317,7 @@ def run_one_mode(mode, all_groups, model_path, max_gen_tokens=50, num_iters=3):
     llm = LLM(
         model=model_path,
         **ENGINE_KWARGS,
-        additional_config={"mamba_cache_mode": mode},
+        mamba_cache_mode=mode,
     )
     sp = SamplingParams(temperature=0, max_tokens=max_gen_tokens)
 
