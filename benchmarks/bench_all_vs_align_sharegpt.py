@@ -55,12 +55,23 @@ import urllib.request
 
 # ── Configuration ──────────────────────────────────────────────────────
 
+# Download source selection: "hf" (HuggingFace) or "modelscope" (Alibaba)
+_DOWNLOAD_SOURCE = os.environ.get("SHAREGPT_SOURCE", "hf")
 _HF_ENDPOINT = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
-SHAREGPT_URL = (
-    f"{_HF_ENDPOINT}/datasets/anon8231489123/"
-    "ShareGPT_Vicuna_unfiltered/resolve/main/"
-    "ShareGPT_V3_unfiltered_cleaned_split.json"
-)
+
+SHAREGPT_URLS = {
+    "hf": (
+        f"{_HF_ENDPOINT}/datasets/anon8231489123/"
+        "ShareGPT_Vicuna_unfiltered/resolve/main/"
+        "ShareGPT_V3_unfiltered_cleaned_split.json"
+    ),
+    "modelscope": (
+        "https://www.modelscope.cn/api/v1/datasets/"
+        "otavia/ShareGPT_Vicuna_unfiltered/repo?"
+        "Revision=master&FilePath=ShareGPT_V3_unfiltered_cleaned_split.json"
+    ),
+}
+SHAREGPT_URL = SHAREGPT_URLS.get(_DOWNLOAD_SOURCE, SHAREGPT_URLS["hf"])
 SHAREGPT_CACHE_DIR = "/tmp"
 SHAREGPT_FILENAME = "sharegpt_v3_cleaned.json"
 
@@ -503,14 +514,19 @@ def main():
     parser.add_argument(
         "--hf-mirror", type=str, default=None,
         help="HuggingFace mirror URL (e.g. https://hf-mirror.com)")
+    parser.add_argument(
+        "--source", choices=["hf", "modelscope"], default=None,
+        help="Download source: hf (HuggingFace) or modelscope (Alibaba Cloud)")
     args = parser.parse_args()
 
-    # Apply mirror if specified via CLI (overrides HF_ENDPOINT env var)
-    if args.hf_mirror:
-        global SHAREGPT_URL, _HF_ENDPOINT
-        _HF_ENDPOINT = args.hf_mirror.rstrip("/")
+    # Apply source/mirror overrides
+    global SHAREGPT_URL
+    if args.source:
+        SHAREGPT_URL = SHAREGPT_URLS[args.source]
+    elif args.hf_mirror:
+        endpoint = args.hf_mirror.rstrip("/")
         SHAREGPT_URL = (
-            f"{_HF_ENDPOINT}/datasets/anon8231489123/"
+            f"{endpoint}/datasets/anon8231489123/"
             "ShareGPT_Vicuna_unfiltered/resolve/main/"
             "ShareGPT_V3_unfiltered_cleaned_split.json"
         )
