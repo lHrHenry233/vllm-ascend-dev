@@ -142,42 +142,9 @@ def load_conversations(path):
 
 # ── Prompt construction ────────────────────────────────────────────────
 
-def _tokenize_conversations(conversations, tokenizer, min_tokens,
-                             max_candidates=200):
-    """Tokenize conversations, pre-filtering by char length.
-
-    Only tokenizes conversations likely long enough (using ~3 chars/token
-    heuristic), and stops early once max_candidates are found.
-    Returns list of (conv_idx, text, token_ids).
-    """
-    CHARS_PER_TOKEN = 3  # conservative estimate for mixed-language text
-    min_chars = min_tokens * CHARS_PER_TOKEN
-
-    candidates = []
-    skipped = 0
-    for i, turns in enumerate(conversations):
-        text = "\n\n".join(t.get("value", "") for t in turns)
-        if len(text) < min_chars:
-            skipped += 1
-            continue
-        ids = tokenizer.encode(text, add_special_tokens=False)
-        if len(ids) >= min_tokens:
-            candidates.append((i, text, ids))
-            if len(candidates) >= max_candidates:
-                break
-
-    print(f"  Tokenized {len(candidates) + skipped} convs "
-          f"(skipped {skipped} short, kept {len(candidates)})")
-    return candidates
-
-
-def build_prompt_pairs(scored, tokenizer, target_blocks,
+def build_prompt_pairs(conversations, tokenizer, target_blocks,
                        num_pairs=5, suffix_tokens=300, block_size=1024):
     """Build (R1, R2) prompt pairs with precise prefix block count.
-
-    Args:
-      scored: pre-tokenized list of (conv_idx, text, token_ids)
-              from _tokenize_conversations()
 
     For each pair:
       prefix:   first (target_blocks * block_size) tokens of a conversation
@@ -190,28 +157,32 @@ def build_prompt_pairs(scored, tokenizer, target_blocks,
     target_tokens = target_blocks * block_size
     min_tokens = target_tokens + suffix_tokens
 
-    # Filter to those long enough for this group
-    valid = [(i, text, ids) for i, text, ids in scored
-             if len(ids) >= min_tokens]
-    print(f"  Found {len(valid)} conversations with ≥ {min_tokens} tokens")
+    # Tokenize each conversation and keep those long enough
+    scored = []
+    for i, turns in enumerate(conversations):
+        text = "\n\n".join(t.get("value", "") for t in turns)
+        ids = tokenizer.encode(text, add_special_tokens=False)
+        if len(ids) >= min_tokens:
+            scored.append((i, text, ids))
+
+    print(f"  Found {len(scored)} conversations with ≥ {min_tokens} tokens")
 
     # If not enough single conversations, concatenate shorter ones
-    if len(valid) < num_pairs + 1:
+    if len(scored) < num_pairs + 1:
         print(f"  ⚠ Not enough single conversations; concatenating ...")
         extra = _concatenate_conversations(
-            [(text, ids) for _, text, ids in scored],
-            tokenizer, target_tokens, suffix_tokens,
+            conversations, tokenizer, target_tokens, suffix_tokens,
             num_needed=num_pairs + 5,
         )
-        valid.extend(extra)
+        scored.extend(extra)
 
-    if len(valid) < 2:
+    if len(scored) < 2:
         print(f"  ✗ Cannot build pairs for {target_blocks}-block prefix")
         return []
 
     # Build a suffix pool from all candidates (for suffix_B)
     suffix_pool = []
-    for _, _, ids in valid:
+    for _, _, ids in scored:
         s_ids = ids[target_tokens: target_tokens + suffix_tokens]
         if len(s_ids) >= suffix_tokens // 2:
             suffix_pool.append(tokenizer.decode(s_ids))
@@ -222,7 +193,7 @@ def build_prompt_pairs(scored, tokenizer, target_blocks,
 
     # Construct pairs
     pairs = []
-    for idx, (conv_i, _, ids) in enumerate(valid):
+    for idx, (conv_i, _, ids) in enumerate(scored):
         if len(pairs) >= num_pairs:
             break
 
@@ -262,20 +233,18 @@ def build_prompt_pairs(scored, tokenizer, target_blocks,
     return pairs
 
 
-def _concatenate_conversations(text_ids_list, tokenizer,
+def _concatenate_conversations(conversations, tokenizer,
                                 target_tokens, suffix_tokens,
                                 num_needed=10):
-    """Concatenate shorter conversations to reach target prefix length.
-
-    Args:
-      text_ids_list: list of (text, token_ids) from pre-tokenized data
-    """
+    """Concatenate shorter conversations to reach target prefix length."""
     min_tokens = target_tokens + suffix_tokens
     results = []
     buffer_text = ""
     buffer_len = 0
 
-    for i, (text, ids) in enumerate(text_ids_list):
+    for i, turns in enumerate(conversations):
+        text = "\n\n".join(t.get("value", "") for t in turns)
+        ids = tokenizer.encode(text, add_special_tokens=False)
         piece_len = len(ids)
 
         if buffer_text:
@@ -597,24 +566,14 @@ def main():
             model_path, trust_remote_code=True)
         print(f"✓ Tokenizer loaded (vocab_size={tokenizer.vocab_size})")
 
-        # ── Step 3: Tokenize once (with smallest group's threshold) ──
-        min_blocks = min(args.groups)
-        min_min_tokens = min_blocks * BLOCK_SIZE + SUFFIX_TARGET_TOKENS
-        print(f"\nPre-tokenizing conversations "
-              f"(need ≥ {min_min_tokens} tokens for {min_blocks}-block group) ...")
-        scored = _tokenize_conversations(
-            conversations, tokenizer, min_min_tokens,
-            max_candidates=500,
-        )
-
-        # ── Step 4: Construct prompts from cached tokenization ──
+        # ── Step 3: Construct prompts ──
         all_groups = {}
         for target_blocks in args.groups:
             print(f"\nBuilding {args.convs_per_group} prompt pairs "
                   f"for {target_blocks}-block prefix "
                   f"({target_blocks * BLOCK_SIZE} tokens) ...")
             pairs = build_prompt_pairs(
-                scored, tokenizer, target_blocks,
+                conversations, tokenizer, target_blocks,
                 num_pairs=args.convs_per_group,
                 suffix_tokens=SUFFIX_TARGET_TOKENS,
                 block_size=BLOCK_SIZE,
