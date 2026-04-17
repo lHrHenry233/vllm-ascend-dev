@@ -258,7 +258,7 @@ def _concatenate_conversations(conversations, tokenizer,
 
 # ── Benchmark engine ───────────────────────────────────────────────────
 
-def run_one_mode(mode, all_groups, max_gen_tokens=50, num_iters=3):
+def run_one_mode(mode, all_groups, model_path, max_gen_tokens=50, num_iters=3):
     """Run benchmark for one cache mode across all groups.
 
     Returns: {target_blocks: [conv_result, ...]}
@@ -272,7 +272,7 @@ def run_one_mode(mode, all_groups, max_gen_tokens=50, num_iters=3):
     print(f"{'═' * 70}")
 
     llm = LLM(
-        model=MODEL,
+        model=model_path,
         **ENGINE_KWARGS,
         additional_config={"mamba_cache_mode": mode},
     )
@@ -340,14 +340,14 @@ def run_one_mode(mode, all_groups, max_gen_tokens=50, num_iters=3):
 
 # ── Report ─────────────────────────────────────────────────────────────
 
-def print_report(all_results, align_results, groups):
+def print_report(all_results, align_results, groups, model_path=MODEL):
     """Print side-by-side comparison report."""
     alignment_step = ENGINE_KWARGS["max_num_batched_tokens"] // BLOCK_SIZE
 
     print(f"\n{'═' * 80}")
     print("  BENCHMARK REPORT: ShareGPT Prefix Cache — all-mode vs align-mode")
     print(f"{'═' * 80}")
-    print(f"  Model: {MODEL}")
+    print(f"  Model: {model_path}")
     print(f"  block_size={BLOCK_SIZE}, "
           f"max_num_batched_tokens={ENGINE_KWARGS['max_num_batched_tokens']}")
     print(f"  alignment step = {alignment_step} blocks")
@@ -501,9 +501,8 @@ def main():
         help="Only construct prompts and print stats (no engine)")
     args = parser.parse_args()
 
-    global MODEL, MAX_GEN_TOKENS
-    MODEL = args.model
-    MAX_GEN_TOKENS = args.max_tokens
+    model_path = args.model
+    max_gen_tokens = args.max_tokens
 
     # ── Step 1: Load data ──
     t_start = time.time()
@@ -511,9 +510,9 @@ def main():
     conversations = load_conversations(data_path)
 
     # ── Step 2: Tokenizer ──
-    print(f"\nLoading tokenizer from {MODEL} ...")
+    print(f"\nLoading tokenizer from {model_path} ...")
     from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     print(f"✓ Tokenizer loaded (vocab_size={tokenizer.vocab_size})")
 
     # ── Step 3: Construct prompts ──
@@ -552,15 +551,15 @@ def main():
 
     if args.mode in ("all", "both"):
         all_results = run_one_mode(
-            "all", all_groups, args.max_tokens, args.num_iters)
+            "all", all_groups, model_path, max_gen_tokens, args.num_iters)
 
     if args.mode in ("align", "both"):
         align_results = run_one_mode(
-            "align", all_groups, args.max_tokens, args.num_iters)
+            "align", all_groups, model_path, max_gen_tokens, args.num_iters)
 
     # ── Step 5: Report ──
     if all_results and align_results:
-        print_report(all_results, align_results, args.groups)
+        print_report(all_results, align_results, args.groups, model_path)
     elif all_results:
         print("\n  Only all-mode results available.")
         for blk, group in all_results.items():
