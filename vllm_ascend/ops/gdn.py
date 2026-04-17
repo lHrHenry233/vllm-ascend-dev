@@ -24,6 +24,7 @@ from einops import rearrange
 
 logger = logging.getLogger(__name__)
 _GDN_DEBUG = bool(os.environ.get("GDN_DEBUG", ""))
+_ALIGN_TRITON_CONV1D = bool(os.environ.get("GDN_ALIGN_TRITON_CONV1D", ""))
 
 
 def _dbg(msg: str, *args) -> None:
@@ -453,26 +454,42 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 mixed_qkv_non_spec = None
         elif attn_metadata.num_prefills > 0:
             if mixed_qkv_non_spec is not None:
-                conv_weights_T = conv_weights.transpose(0, 1)
-                activation_num = 1 if self.activation else 0
-                (
-                    query_start_loc_opt,
-                    cache_indices_opt,
-                    initial_state_mode_opt,
-                ) = get_non_spec_causal_conv1d_host_args(attn_metadata)
-                mixed_qkv_non_spec = torch.ops._C_ascend.npu_causal_conv1d_custom(
-                    mixed_qkv_non_spec,
-                    conv_weights_T,
-                    conv_state=self_kv_cache[0],
-                    bias_opt=self.conv1d.bias,
-                    query_start_loc_opt=query_start_loc_opt,
-                    cache_indices_opt=cache_indices_opt,
-                    initial_state_mode_opt=initial_state_mode_opt,
-                    num_accepted_tokens_opt=[],
-                    activation_mode=activation_num,
-                    pad_slot_id=PAD_SLOT_ID,
-                    run_mode=0,
-                )
+                if _ALIGN_TRITON_CONV1D:
+                    # Triton conv1d for align-mode (fair benchmark vs all-mode).
+                    # Same kernel as all-mode with IS_APC_ENABLED=False.
+                    # 1D cache_indices works: stride=1, init/last_index=0 → SOURCE==DEST.
+                    mixed_qkv_non_spec = causal_conv1d_fwd_npu(
+                        x=mixed_qkv_non_spec,
+                        weight=conv_weights,
+                        bias=self.conv1d.bias,
+                        conv_states=conv_state,
+                        query_start_loc=non_spec_query_start_loc,
+                        cache_indices=non_spec_state_indices_tensor,
+                        has_initial_state=has_initial_state,
+                        activation=self.activation,
+                        pad_slot_id=PAD_SLOT_ID,
+                    )
+                else:
+                    conv_weights_T = conv_weights.transpose(0, 1)
+                    activation_num = 1 if self.activation else 0
+                    (
+                        query_start_loc_opt,
+                        cache_indices_opt,
+                        initial_state_mode_opt,
+                    ) = get_non_spec_causal_conv1d_host_args(attn_metadata)
+                    mixed_qkv_non_spec = torch.ops._C_ascend.npu_causal_conv1d_custom(
+                        mixed_qkv_non_spec,
+                        conv_weights_T,
+                        conv_state=self_kv_cache[0],
+                        bias_opt=self.conv1d.bias,
+                        query_start_loc_opt=query_start_loc_opt,
+                        cache_indices_opt=cache_indices_opt,
+                        initial_state_mode_opt=initial_state_mode_opt,
+                        num_accepted_tokens_opt=[],
+                        activation_mode=activation_num,
+                        pad_slot_id=PAD_SLOT_ID,
+                        run_mode=0,
+                    )
         elif attn_metadata.num_decodes > 0:
             mixed_qkv_non_spec = causal_conv1d_update_npu(
                 mixed_qkv_non_spec,
