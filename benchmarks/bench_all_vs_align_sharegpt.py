@@ -517,6 +517,12 @@ def main():
     parser.add_argument(
         "--source", choices=["hf", "modelscope"], default=None,
         help="Download source: hf (HuggingFace) or modelscope (Alibaba Cloud)")
+    parser.add_argument(
+        "--export-prompts", type=str, default=None,
+        help="Export constructed prompt pairs to JSON (skip engine run)")
+    parser.add_argument(
+        "--load-prompts", type=str, default=None,
+        help="Load pre-built prompt pairs from JSON (skip download+tokenize)")
     args = parser.parse_args()
 
     # Apply source/mirror overrides
@@ -534,33 +540,49 @@ def main():
     model_path = args.model
     max_gen_tokens = args.max_tokens
 
-    # ── Step 1: Load data ──
     t_start = time.time()
-    data_path = args.data_path or download_sharegpt()
-    conversations = load_conversations(data_path)
 
-    # ── Step 2: Tokenizer ──
-    print(f"\nLoading tokenizer from {model_path} ...")
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    print(f"✓ Tokenizer loaded (vocab_size={tokenizer.vocab_size})")
+    # ── Load pre-built prompts or build from scratch ──
+    if args.load_prompts:
+        print(f"\nLoading pre-built prompts from {args.load_prompts} ...")
+        with open(args.load_prompts) as f:
+            saved = json.load(f)
+        all_groups = {int(k): v for k, v in saved.items()}
+        # Filter to requested groups
+        if args.groups != DEFAULT_GROUPS:
+            all_groups = {k: v for k, v in all_groups.items()
+                          if k in args.groups}
+        print(f"✓ Loaded {sum(len(v) for v in all_groups.values())} "
+              f"prompt pairs across {len(all_groups)} groups")
+    else:
+        # ── Step 1: Load data ──
+        data_path = args.data_path or download_sharegpt()
+        conversations = load_conversations(data_path)
 
-    # ── Step 3: Construct prompts ──
-    all_groups = {}
-    for target_blocks in args.groups:
-        print(f"\nBuilding {args.convs_per_group} prompt pairs "
-              f"for {target_blocks}-block prefix "
-              f"({target_blocks * BLOCK_SIZE} tokens) ...")
-        pairs = build_prompt_pairs(
-            conversations, tokenizer, target_blocks,
-            num_pairs=args.convs_per_group,
-            suffix_tokens=SUFFIX_TARGET_TOKENS,
-            block_size=BLOCK_SIZE,
-        )
-        if pairs:
-            all_groups[target_blocks] = pairs
-        else:
-            print(f"  ✗ Skipping {target_blocks}-block group (insufficient data)")
+        # ── Step 2: Tokenizer ──
+        print(f"\nLoading tokenizer from {model_path} ...")
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_path, trust_remote_code=True)
+        print(f"✓ Tokenizer loaded (vocab_size={tokenizer.vocab_size})")
+
+        # ── Step 3: Construct prompts ──
+        all_groups = {}
+        for target_blocks in args.groups:
+            print(f"\nBuilding {args.convs_per_group} prompt pairs "
+                  f"for {target_blocks}-block prefix "
+                  f"({target_blocks * BLOCK_SIZE} tokens) ...")
+            pairs = build_prompt_pairs(
+                conversations, tokenizer, target_blocks,
+                num_pairs=args.convs_per_group,
+                suffix_tokens=SUFFIX_TARGET_TOKENS,
+                block_size=BLOCK_SIZE,
+            )
+            if pairs:
+                all_groups[target_blocks] = pairs
+            else:
+                print(f"  ✗ Skipping {target_blocks}-block group "
+                      f"(insufficient data)")
 
     if not all_groups:
         print("\n✗ No prompt pairs could be constructed. Exiting.")
@@ -570,6 +592,20 @@ def main():
     print_data_summary(all_groups)
     t_data = time.time() - t_start
     print(f"\n  Data preparation took {t_data:.1f}s")
+
+    # Export prompts if requested
+    if args.export_prompts:
+        export_path = args.export_prompts
+        with open(export_path, "w") as f:
+            json.dump(
+                {str(k): v for k, v in all_groups.items()},
+                f, ensure_ascii=False, indent=2,
+            )
+        size_kb = os.path.getsize(export_path) / 1024
+        print(f"\n✓ Exported prompts to {export_path} ({size_kb:.0f} KB)")
+        if args.dry_run:
+            print("  [DRY RUN + EXPORT] Done.")
+            return
 
     if args.dry_run:
         print("\n  [DRY RUN] Skipping engine runs.")
