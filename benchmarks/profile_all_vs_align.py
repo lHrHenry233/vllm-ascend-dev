@@ -66,10 +66,33 @@ def extract_ttft(output) -> float:
     m = output.metrics
     if m is None:
         return float("nan")
-    # vllm 0.19: RequestStateStats uses first_token_ts / arrival_ts (float, unix epoch)
-    # Use _ts attributes directly — _time variants may have different semantics
-    arrival = getattr(m, 'arrival_ts', None)
-    first_tok = getattr(m, 'first_token_ts', None)
+    # Debug: print all attributes on first call
+    if not hasattr(extract_ttft, '_dumped'):
+        extract_ttft._dumped = True
+        attrs = {k: type(getattr(m, k)).__name__
+                 for k in dir(m) if not k.startswith('_')}
+        print(f"  [DEBUG] metrics type: {type(m).__name__}")
+        print(f"  [DEBUG] metrics attrs: {attrs}")
+        # Also try to print actual values for time-related attrs
+        for k in sorted(attrs):
+            if 'time' in k.lower() or 'ts' in k.lower() or 'token' in k.lower():
+                try:
+                    print(f"  [DEBUG]   m.{k} = {getattr(m, k)}")
+                except Exception as e:
+                    print(f"  [DEBUG]   m.{k} = ERROR: {e}")
+    # Try common attribute names
+    for arrival_attr in ('arrival_ts', 'arrival_time', 'arrival'):
+        arrival = getattr(m, arrival_attr, None)
+        if arrival is not None and isinstance(arrival, (int, float)) and arrival > 0:
+            break
+    else:
+        arrival = None
+    for ft_attr in ('first_token_ts', 'first_token_time', 'first_token'):
+        first_tok = getattr(m, ft_attr, None)
+        if first_tok is not None and isinstance(first_tok, (int, float)) and first_tok > 0:
+            break
+    else:
+        first_tok = None
     if arrival is None or first_tok is None:
         return float("nan")
     return (first_tok - arrival) * 1000
@@ -125,7 +148,7 @@ def run_profiled(mode: str, output_dir: str, max_tokens: int = 10,
         gc_detect_threshold=None,
     )
 
-    ttft_results = {"r1": [], "r2": []}
+    ttft_results = {"r1": [], "r2": [], "r1_wall": [], "r2_wall": []}
 
     profiler = torch_npu.profiler.profile(
         activities=[
@@ -160,6 +183,8 @@ def run_profiled(mode: str, output_dir: str, max_tokens: int = 10,
 
             ttft_results["r1"].append(r1_ttft)
             ttft_results["r2"].append(r2_ttft)
+            ttft_results["r1_wall"].append(r1_wall)
+            ttft_results["r2_wall"].append(r2_wall)
 
             print(f"  iter {i+1}/{profile_iters}: "
                   f"R1_TTFT={r1_ttft:.1f}ms R1_wall={r1_wall:.1f}ms | "
@@ -173,14 +198,29 @@ def run_profiled(mode: str, output_dir: str, max_tokens: int = 10,
         print(f"\n[{mode}] Profiler stopped. Trace saved to: {profile_dir}")
 
     # ── Summary ──
-    import statistics
+    import math, statistics
     r2_ttfts = ttft_results["r2"]
     r1_ttfts = ttft_results["r1"]
+    r1_valid = [x for x in r1_ttfts if not math.isnan(x)]
+    r2_valid = [x for x in r2_ttfts if not math.isnan(x)]
     print(f"\n[{mode}] TTFT Summary:")
-    print(f"  R1 mean TTFT: {statistics.mean(r1_ttfts):.1f}ms")
-    print(f"  R2 mean TTFT: {statistics.mean(r2_ttfts):.1f}ms")
-    if len(r2_ttfts) > 1:
-        print(f"  R2 stdev:     {statistics.stdev(r2_ttfts):.1f}ms")
+    if r1_valid:
+        print(f"  R1 mean TTFT: {statistics.mean(r1_valid):.1f}ms")
+    else:
+        print(f"  R1 mean TTFT: N/A (metrics unavailable, use wall time)")
+    if r2_valid:
+        print(f"  R2 mean TTFT: {statistics.mean(r2_valid):.1f}ms")
+        if len(r2_valid) > 1:
+            print(f"  R2 stdev:     {statistics.stdev(r2_valid):.1f}ms")
+    else:
+        print(f"  R2 mean TTFT: N/A (metrics unavailable, use wall time)")
+    # Wall time summary
+    r1_walls = ttft_results.get("r1_wall", [])
+    r2_walls = ttft_results.get("r2_wall", [])
+    if r1_walls:
+        print(f"  R1 mean wall: {statistics.mean(r1_walls):.1f}ms")
+    if r2_walls:
+        print(f"  R2 mean wall: {statistics.mean(r2_walls):.1f}ms")
 
     del llm
     import gc
