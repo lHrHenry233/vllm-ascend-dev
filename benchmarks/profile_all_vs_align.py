@@ -305,13 +305,17 @@ def main():
                         help="Warmup requests before profiling (default: 4)")
     parser.add_argument("--profile-rounds", type=int, default=3,
                         help="R1+R2 rounds to profile (default: 3)")
+    parser.add_argument("--model", type=str, default=None,
+                        help="Model path (default: use script constant)")
     parser.add_argument("--port", type=int, default=8100,
                         help="Server port (default: 8100)")
     args = parser.parse_args()
     
-    global PORT, BASE_URL
+    global PORT, BASE_URL, MODEL
     PORT = args.port
     BASE_URL = f"http://{HOST}:{PORT}"
+    if args.model:
+        MODEL = args.model
 
     print(f"Model: {MODEL}")
     print(f"Server: {BASE_URL}")
