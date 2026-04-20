@@ -140,7 +140,6 @@ def start_server(mode: str, profile_dir: str) -> subprocess.Popen:
         "--max-model-len", "8192",
         "--max-num-batched-tokens", "4096",
         "--mamba-cache-mode", mode,
-        "--disable-log-requests",
         # Profiler config (dotted path syntax per vllm-ascend convention)
         "--profiler-config.profiler", "torch",
         "--profiler-config.torch_profiler_dir", profile_dir,
