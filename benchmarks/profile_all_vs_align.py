@@ -167,7 +167,7 @@ def stop_server(proc: subprocess.Popen):
     if proc.poll() is None:
         proc.send_signal(signal.SIGINT)
         try:
-            proc.wait(timeout=30)
+            proc.wait(timeout=60)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
@@ -258,11 +258,13 @@ def run_profile_session(mode: str, output_dir: str, max_tokens: int = 10,
         # Stop profiling
         print(f"\n[{mode}] Stopping profiler...")
         try:
-            http_post(f"{BASE_URL}/stop_profile", timeout=60)
+            http_post(f"{BASE_URL}/stop_profile", timeout=120)
             print(f"[{mode}] Profiler stopped. Traces flushing to disk...")
-            time.sleep(5)  # Give profiler time to flush
         except Exception as e:
-            print(f"[WARNING] stop_profile failed: {e}")
+            print(f"[WARNING] stop_profile request timed out: {e}")
+            print(f"[{mode}] Waiting for profiler to flush traces...")
+        # Wait for trace_view.json to be written (flush can take 30-60s)
+        time.sleep(30)
         
         # Summary
         import statistics
