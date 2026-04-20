@@ -5,21 +5,21 @@
 ```bash
 # ALL mode
 python3 -m vllm.entrypoints.openai.api_server \
-  --model /shared/models/Qwen3.5-0.8B-ms \
+  --model /data/Qwen3.5-9B \
   --port 8100 --enforce-eager \
   --enable-prefix-caching --mamba-cache-mode all \
   --max-model-len 8192 --max-num-batched-tokens 4096 \
-  --gpu-memory-utilization 0.7 \
-  --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile_all", "torch_profiler_with_stack": false}'
+  --gpu-memory-utilization 0.9 \
+  --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./prof_all", "torch_profiler_with_stack": false}'
 
 # ALIGN mode (对比用，换终端)
 python3 -m vllm.entrypoints.openai.api_server \
-  --model /shared/models/Qwen3.5-0.8B-ms \
+  --model /data/Qwen3.5-9B \
   --port 8100 --enforce-eager \
   --enable-prefix-caching --mamba-cache-mode align \
   --max-model-len 8192 --max-num-batched-tokens 4096 \
-  --gpu-memory-utilization 0.7 \
-  --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./vllm_profile_align", "torch_profiler_with_stack": false}'
+  --gpu-memory-utilization 0.9 \
+  --profiler-config '{"profiler": "torch", "torch_profiler_dir": "./prof_align", "torch_profiler_with_stack": false}'
 ```
 
 ## Profiling 三步 curl
@@ -28,16 +28,15 @@ python3 -m vllm.entrypoints.openai.api_server \
 # ━━━━ Step 1: 开始采集 ━━━━
 curl -X POST http://localhost:8100/start_profile
 
-# ━━━━ Step 2: 发请求 (多发几轮，覆盖 cache fill + cache hit) ━━━━
-# R1: 填充缓存
+# ━━━━ Step 2: 发请求 (R1 填 cache, R2 cache hit) ━━━━
+# prompt_a.json / prompt_b.json: ~2000 token 共享前缀, max_tokens=1
 curl -s http://localhost:8100/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"/shared/models/Qwen3.5-0.8B-ms","messages":[{"role":"user","content":"你的prompt_A内容"}],"max_tokens":10,"temperature":0}'
+  -d @benchmarks/prompt_a.json
 
-# R2: cache hit (共享前缀，不同后缀)
 curl -s http://localhost:8100/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"/shared/models/Qwen3.5-0.8B-ms","messages":[{"role":"user","content":"你的prompt_B内容"}],"max_tokens":10,"temperature":0}'
+  -d @benchmarks/prompt_b.json
 
 # (可重复多轮 R1+R2)
 
@@ -51,11 +50,11 @@ curl -X POST http://localhost:8100/stop_profile
 # 等 1-2 分钟让 profiler flush 完成，然后:
 python3 -c "
 from torch_npu.profiler.profiler import analyse
-analyse('./vllm_profile_all/*_ascend_pt/')
+analyse('./prof_all/*_ascend_pt/')
 "
 
 # 分析完的结果在:
-ls ./vllm_profile_all/*_ascend_pt/ASCEND_PROFILER_OUTPUT/
+ls ./prof_all/*_ascend_pt/ASCEND_PROFILER_OUTPUT/
 # → op_statistic.csv, operator_details.csv, kernel_details.csv, trace_view.json
 ```
 
