@@ -66,9 +66,10 @@ def extract_ttft(output) -> float:
     m = output.metrics
     if m is None:
         return float("nan")
-    # vllm 0.19: RequestStateStats uses first_token_ts / arrival_ts
-    arrival = getattr(m, 'arrival_time', None) or getattr(m, 'arrival_ts', None)
-    first_tok = getattr(m, 'first_token_time', None) or getattr(m, 'first_token_ts', None)
+    # vllm 0.19: RequestStateStats uses first_token_ts / arrival_ts (float, unix epoch)
+    # Use _ts attributes directly — _time variants may have different semantics
+    arrival = getattr(m, 'arrival_ts', None)
+    first_tok = getattr(m, 'first_token_ts', None)
     if arrival is None or first_tok is None:
         return float("nan")
     return (first_tok - arrival) * 1000
@@ -182,6 +183,8 @@ def run_profiled(mode: str, output_dir: str, max_tokens: int = 10,
         print(f"  R2 stdev:     {statistics.stdev(r2_ttfts):.1f}ms")
 
     del llm
+    import gc
+    gc.collect()
     return ttft_results
 
 
@@ -212,6 +215,8 @@ def main():
             args.warmup_iters, args.profile_iters)
 
     if args.mode in ("align", "both"):
+        import time
+        time.sleep(3)  # allow NPU resources to fully release
         results["align"] = run_profiled(
             "align", args.output_dir, args.max_tokens,
             args.warmup_iters, args.profile_iters)
