@@ -64,9 +64,14 @@ ENGINE_KWARGS = dict(
 def extract_ttft(output) -> float:
     """Extract TTFT (ms) from a single RequestOutput."""
     m = output.metrics
-    if m is None or m.first_token_time is None or m.arrival_time is None:
+    if m is None:
         return float("nan")
-    return (m.first_token_time - m.arrival_time) * 1000
+    # vllm 0.19: RequestStateStats uses first_token_ts / arrival_ts
+    arrival = getattr(m, 'arrival_time', None) or getattr(m, 'arrival_ts', None)
+    first_tok = getattr(m, 'first_token_time', None) or getattr(m, 'first_token_ts', None)
+    if arrival is None or first_tok is None:
+        return float("nan")
+    return (first_tok - arrival) * 1000
 
 
 def run_profiled(mode: str, output_dir: str, max_tokens: int = 10,
