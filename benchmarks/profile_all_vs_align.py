@@ -62,40 +62,18 @@ ENGINE_KWARGS = dict(
 
 
 def extract_ttft(output) -> float:
-    """Extract TTFT (ms) from a single RequestOutput."""
+    """Extract TTFT (ms) from a single RequestOutput.
+    
+    vllm 0.19 RequestStateStats has `first_token_latency` (seconds)
+    which is the time from request arrival to first token generation.
+    """
     m = output.metrics
     if m is None:
         return float("nan")
-    # Debug: print all attributes on first call
-    if not hasattr(extract_ttft, '_dumped'):
-        extract_ttft._dumped = True
-        attrs = {k: type(getattr(m, k)).__name__
-                 for k in dir(m) if not k.startswith('_')}
-        print(f"  [DEBUG] metrics type: {type(m).__name__}")
-        print(f"  [DEBUG] metrics attrs: {attrs}")
-        # Also try to print actual values for time-related attrs
-        for k in sorted(attrs):
-            if 'time' in k.lower() or 'ts' in k.lower() or 'token' in k.lower():
-                try:
-                    print(f"  [DEBUG]   m.{k} = {getattr(m, k)}")
-                except Exception as e:
-                    print(f"  [DEBUG]   m.{k} = ERROR: {e}")
-    # Try common attribute names
-    for arrival_attr in ('arrival_ts', 'arrival_time', 'arrival'):
-        arrival = getattr(m, arrival_attr, None)
-        if arrival is not None and isinstance(arrival, (int, float)) and arrival > 0:
-            break
-    else:
-        arrival = None
-    for ft_attr in ('first_token_ts', 'first_token_time', 'first_token'):
-        first_tok = getattr(m, ft_attr, None)
-        if first_tok is not None and isinstance(first_tok, (int, float)) and first_tok > 0:
-            break
-    else:
-        first_tok = None
-    if arrival is None or first_tok is None:
-        return float("nan")
-    return (first_tok - arrival) * 1000
+    latency = getattr(m, 'first_token_latency', None)
+    if latency is not None and isinstance(latency, (int, float)):
+        return latency * 1000  # seconds → ms
+    return float("nan")
 
 
 def run_profiled(mode: str, output_dir: str, max_tokens: int = 10,
@@ -225,6 +203,13 @@ def run_profiled(mode: str, output_dir: str, max_tokens: int = 10,
     del llm
     import gc
     gc.collect()
+
+    # Save results to JSON for subprocess communication
+    import json
+    summary_path = os.path.join(output_dir, f"{mode}_summary.json")
+    with open(summary_path, "w") as f:
+        json.dump(ttft_results, f)
+
     return ttft_results
 
 
@@ -255,25 +240,59 @@ def main():
             args.warmup_iters, args.profile_iters)
 
     if args.mode in ("align", "both"):
-        import time
-        time.sleep(3)  # allow NPU resources to fully release
-        results["align"] = run_profiled(
-            "align", args.output_dir, args.max_tokens,
-            args.warmup_iters, args.profile_iters)
+        if "all" in results:
+            # NPU cannot be re-initialized in forked subprocesses.
+            # Must run align mode in a separate process.
+            import subprocess, sys, json
+            print("\n[NOTE] Spawning separate process for align mode "
+                  "(NPU cannot re-init in same process)...")
+            cmd = [sys.executable, __file__,
+                   "--mode", "align",
+                   "--output-dir", args.output_dir,
+                   "--max-tokens", str(args.max_tokens),
+                   "--warmup-iters", str(args.warmup_iters),
+                   "--profile-iters", str(args.profile_iters)]
+            env = dict(os.environ)
+            proc = subprocess.run(cmd, env=env)
+            if proc.returncode != 0:
+                print(f"[ERROR] Align mode subprocess exited with code {proc.returncode}")
+            # Can't easily retrieve results from subprocess, so read from saved file
+            align_summary = os.path.join(args.output_dir, "align_summary.json")
+            if os.path.exists(align_summary):
+                with open(align_summary) as f:
+                    results["align"] = json.load(f)
+        else:
+            results["align"] = run_profiled(
+                "align", args.output_dir, args.max_tokens,
+                args.warmup_iters, args.profile_iters)
 
     # ── Comparison ──
     if "all" in results and "align" in results:
-        import statistics
-        all_r2 = statistics.mean(results["all"]["r2"])
-        align_r2 = statistics.mean(results["align"]["r2"])
-        speedup = align_r2 / all_r2 if all_r2 > 0 else float("inf")
+        import math, statistics
+
+        def safe_mean(lst):
+            valid = [x for x in lst if not math.isnan(x)]
+            return statistics.mean(valid) if valid else float("nan")
 
         print(f"\n{'='*70}")
-        print(f"  TTFT COMPARISON (R2 = cache hit)")
+        print(f"  COMPARISON (R2 = cache hit)")
         print(f"{'='*70}")
-        print(f"  all-mode  R2 TTFT mean: {all_r2:.1f}ms")
-        print(f"  align-mode R2 TTFT mean: {align_r2:.1f}ms")
-        print(f"  Speedup (all vs align): {speedup:.2f}x")
+
+        # TTFT comparison
+        all_r2_ttft = safe_mean(results["all"]["r2"])
+        align_r2_ttft = safe_mean(results["align"]["r2"])
+        if not math.isnan(all_r2_ttft) and not math.isnan(align_r2_ttft):
+            speedup = align_r2_ttft / all_r2_ttft if all_r2_ttft > 0 else float("inf")
+            print(f"  [TTFT]  all={all_r2_ttft:.1f}ms  align={align_r2_ttft:.1f}ms  "
+                  f"speedup={speedup:.2f}x")
+
+        # Wall time comparison (more reliable)
+        all_r2_wall = safe_mean(results["all"].get("r2_wall", []))
+        align_r2_wall = safe_mean(results["align"].get("r2_wall", []))
+        if not math.isnan(all_r2_wall) and not math.isnan(align_r2_wall):
+            speedup_wall = align_r2_wall / all_r2_wall if all_r2_wall > 0 else float("inf")
+            print(f"  [Wall]  all={all_r2_wall:.1f}ms  align={align_r2_wall:.1f}ms  "
+                  f"speedup={speedup_wall:.2f}x")
         print(f"{'='*70}")
 
     print("\n[NEXT STEPS]")
