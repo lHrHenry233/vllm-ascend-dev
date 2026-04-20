@@ -3,8 +3,6 @@
 # ALL vs ALIGN profiling — 一键完成两轮采集 + analyse
 # 用法: bash benchmarks/profile_all_vs_align.sh [--model PATH]
 # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-set -e
-
 MODEL="/data/Qwen3.5-9B"
 PORT=8100
 FLUSH_WAIT=120
@@ -25,44 +23,52 @@ warn()  { echo -e "\033[1;33m[WARN]\033[0m  $*"; }
 error() { echo -e "\033[1;31m[ERROR]\033[0m $*"; exit 1; }
 
 wait_for_server() {
-    info "等待 server 启动..."
-    for i in $(seq 1 120); do
+    info "等待 server 启动 (9B 模型加载可能需要 3-5 分钟)..."
+    for i in $(seq 1 300); do
+        if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
+            error "Server 进程已退出! 检查日志: prof_*.server.log"
+        fi
         if curl -s "${BASE_URL}/health" > /dev/null 2>&1; then
             info "Server 就绪! (${i}s)"
             return 0
         fi
         sleep 1
     done
-    error "Server 120s 未启动"
+    error "Server 300s 未启动"
 }
 
 run_profiling() {
     local mode=$1
     info "━━━ 预热 (${mode}) ━━━"
-    curl -s "${BASE_URL}/v1/chat/completions" \
+    local warmup_resp
+    warmup_resp=$(curl -s --max-time 300 "${BASE_URL}/v1/chat/completions" \
         -H "Content-Type: application/json" \
-        -d "{\"model\":\"${MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"max_tokens\":1,\"temperature\":0}" \
-        > /dev/null
+        -d "{\"model\":\"${MODEL}\",\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}],\"max_tokens\":1,\"temperature\":0}")
+    if [[ $? -ne 0 ]]; then
+        warn "预热请求失败! 检查 server 日志: prof_${mode}.server.log"
+        return 1
+    fi
+    info "预热返回: $(echo "${warmup_resp}" | head -c 200)"
     sleep 2
 
     info "━━━ start_profile ━━━"
-    curl -s -X POST "${BASE_URL}/start_profile"
+    curl -s -X POST "${BASE_URL}/start_profile" || warn "start_profile 失败"
     echo ""
 
     info "━━━ R1: 填充缓存 ━━━"
-    curl -s "${BASE_URL}/v1/chat/completions" \
+    curl -s --max-time 300 "${BASE_URL}/v1/chat/completions" \
         -H "Content-Type: application/json" \
-        -d @"${SCRIPT_DIR}/prompt_a.json"
+        -d @"${SCRIPT_DIR}/prompt_a.json" || warn "R1 请求失败"
     echo ""
 
     info "━━━ R2: cache hit ━━━"
-    curl -s "${BASE_URL}/v1/chat/completions" \
+    curl -s --max-time 300 "${BASE_URL}/v1/chat/completions" \
         -H "Content-Type: application/json" \
-        -d @"${SCRIPT_DIR}/prompt_b.json"
+        -d @"${SCRIPT_DIR}/prompt_b.json" || warn "R2 请求失败"
     echo ""
 
     info "━━━ stop_profile ━━━"
-    curl -s -X POST "${BASE_URL}/stop_profile"
+    curl -s -X POST "${BASE_URL}/stop_profile" || warn "stop_profile 失败"
     echo ""
 }
 
