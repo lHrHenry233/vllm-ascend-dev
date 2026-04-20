@@ -32,9 +32,6 @@ import os
 import sys
 import time
 
-os.environ.setdefault("VLLM_USE_MODELSCOPE", "True")
-os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
-
 # Import prompt data
 try:
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
