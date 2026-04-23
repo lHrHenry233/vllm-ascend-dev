@@ -15,9 +15,22 @@
 # limitations under the License.
 #
 
+import logging
+import os
+
 import torch
 import torch_npu
 from einops import rearrange
+
+logger = logging.getLogger(__name__)
+_GDN_DEBUG = bool(os.environ.get("GDN_DEBUG", ""))
+_ALIGN_TRITON_CONV1D = bool(os.environ.get("GDN_ALIGN_TRITON_CONV1D", ""))
+
+
+def _dbg(msg: str, *args) -> None:
+    """Print debug message only when GDN_DEBUG env var is set."""
+    if _GDN_DEBUG:
+        print(msg % args if args else msg, flush=True)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fla.ops import (
     fused_recurrent_gated_delta_rule,
@@ -35,8 +48,182 @@ from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_s
 from vllm_ascend.ops.triton.fla.sigmoid_gating import fused_sigmoid_gating_delta_rule_update
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
 from vllm_ascend.ops.triton.fused_gdn_gating import fused_gdn_gating_patch
-from vllm_ascend.ops.triton.mamba.causal_conv1d import causal_conv1d_update_npu
+from vllm_ascend.ops.triton.mamba.causal_conv1d import (
+    causal_conv1d_fwd_npu,
+    causal_conv1d_update_npu,
+)
 from vllm_ascend.utils import enable_sp
+
+# ──────────────────────────────────────────────────────────────────
+# All-mode prefix caching helpers (P4)
+# ──────────────────────────────────────────────────────────────────
+
+
+def _build_initial_state(
+    ssm_state: torch.Tensor,
+    metadata,
+    num_decodes: int,
+    num_prefills: int,
+    transpose_state: bool = True,
+) -> torch.Tensor:
+    """Assemble initial_state tensor for chunk kernel from pool slots.
+
+    Reads SOURCE pool slots for both decode and prefill sequences.
+    Decode uses block_state_indices[:num_decodes] (SOURCE = last-computed block).
+    Prefill uses block_state_indices[num_decodes:] (SOURCE = last-computed block).
+    Sequences without initial state (has_initial_state=False) are zeroed.
+
+    Args:
+        ssm_state: Pool tensor [N_pool, H, K/V, V/K]
+        metadata: GDNAttentionMetadata with all-mode fields
+        num_decodes: Number of decode sequences
+        num_prefills: Number of prefill sequences
+        transpose_state: If True, transpose pool [V,K]->[K,V] for kernel
+                         (Qwen3Next=True, Qwen3.5=False)
+
+    Returns:
+        initial_state: [num_seqs, H, K, V] in kernel layout
+    """
+    num_seqs = num_decodes + num_prefills
+    initial = ssm_state.new_zeros(num_seqs, *ssm_state.shape[1:])
+
+    source_slots = metadata.block_state_indices  # [num_seqs]
+
+    if num_decodes > 0:
+        d_slots = source_slots[:num_decodes]
+        valid = d_slots >= 0
+        if valid.any():
+            state = ssm_state[d_slots[valid].long()]
+            if transpose_state:
+                state = state.transpose(-1, -2).contiguous()
+            initial[:num_decodes][valid] = state
+
+    if num_prefills > 0:
+        p_slots = source_slots[num_decodes:]
+        valid = p_slots >= 0
+        if valid.any():
+            state = ssm_state[p_slots[valid].long()]
+            if transpose_state:
+                state = state.transpose(-1, -2).contiguous()
+            initial[num_decodes:][valid] = state
+        # Zero out prefill seqs without initial state
+        has_init = metadata.has_initial_state
+        if has_init is not None:
+            no_init = ~has_init[num_decodes:]
+            initial[num_decodes:][no_init] = 0
+
+    return initial
+
+
+def _write_final_states(
+    ssm_state: torch.Tensor,
+    final_state: torch.Tensor,
+    metadata,
+    num_decodes: int,
+    transpose_state: bool = True,
+) -> None:
+    """Write kernel final_state back to DEST pool slots.
+
+    DEST = non_spec_state_indices_tensor (overridden to last-scheduled block).
+
+    Args:
+        ssm_state: Pool tensor [N_pool, H, K/V, V/K]
+        final_state: [num_seqs, H, K, V] from kernel
+        metadata: GDNAttentionMetadata with all-mode fields
+        num_decodes: Number of decode sequences
+        transpose_state: If True, transpose kernel [K,V]->[V,K] for pool
+    """
+    dest_slots = metadata.non_spec_state_indices_tensor  # [num_seqs]
+
+    if num_decodes > 0:
+        d_dest = dest_slots[:num_decodes]
+        valid = d_dest >= 0
+        if valid.any():
+            state = final_state[:num_decodes][valid].to(ssm_state.dtype)
+            if transpose_state:
+                state = state.transpose(-1, -2).contiguous()
+            ssm_state[d_dest[valid].long()] = state
+
+    num_prefills = final_state.shape[0] - num_decodes
+    if num_prefills > 0:
+        p_dest = dest_slots[num_decodes:]
+        valid = p_dest >= 0
+        if valid.any():
+            state = final_state[num_decodes:][valid].to(ssm_state.dtype)
+            if transpose_state:
+                state = state.transpose(-1, -2).contiguous()
+            ssm_state[p_dest[valid].long()] = state
+
+
+
+def _scatter_intermediate_states(
+    ssm_state: torch.Tensor,
+    chunk_history: torch.Tensor,
+    metadata,
+    num_decodes: int,
+    transpose_state: bool = True,
+) -> None:
+    """Write intermediate block boundary states from chunk_history to pool.
+
+    Only processes prefill sequences (decode seqs span at most 1 block).
+    Uses prefill_chunk_offsets to locate each prefill's chunks in h tensor.
+
+    Args:
+        ssm_state: Pool tensor [N_pool, H, K/V, V/K]
+        chunk_history: [total_chunks, H, K, V] intermediate states from kernel
+        metadata: GDNAttentionMetadata with all-mode fields
+        num_decodes: Number of decode sequences
+        transpose_state: If True, transpose kernel [K,V]->[V,K] for pool
+    """
+    block_size = metadata.mamba_block_size
+    chunk_size = metadata.all_mode_chunk_size
+    chunks_per_block = block_size // chunk_size
+
+    prefill_chunk_start = metadata.prefill_chunk_start
+    prefill_offsets = metadata.prefill_chunk_offsets  # [num_prefills + 1]
+    if prefill_offsets is None:
+        return
+    num_prefills = len(prefill_offsets) - 1
+
+    block_table = metadata.block_table_2d[num_decodes:]
+    first_sched = metadata.block_idx_first_scheduled_token[num_decodes:]
+    last_sched = metadata.block_idx_last_scheduled_token[num_decodes:]
+    num_comp = metadata.num_computed_tokens_all[num_decodes:]
+
+    for seq_idx in range(num_prefills):
+        chunk_start = prefill_offsets[seq_idx].item()
+        block_first = first_sched[seq_idx].item()
+        block_last = last_sched[seq_idx].item()
+        n_blocks = block_last - block_first
+        if n_blocks <= 0:
+            continue
+
+        cache_slots = block_table[seq_idx, block_first:block_last]
+        valid = cache_slots >= 0
+
+        # Compute aligned chunk index in h tensor
+        first_chunk = prefill_chunk_start + chunk_start
+        first_aligned_chunk = first_chunk + chunks_per_block
+
+        num_unaligned = num_comp[seq_idx].item() % block_size
+        assert num_unaligned == 0, (
+            f"Scheduler must guarantee block-aligned context: "
+            f"context_len={num_comp[seq_idx].item()}, "
+            f"block_size={block_size}"
+        )
+
+        states = chunk_history[
+            first_aligned_chunk:
+            first_aligned_chunk + n_blocks * chunks_per_block:
+            chunks_per_block
+        ]
+
+        write_states = states[:valid.sum()].to(ssm_state.dtype)
+        if transpose_state:
+            write_states = write_states.transpose(-1, -2).contiguous()
+        ssm_state[cache_slots[valid].long()] = write_states
+
+    return
 
 
 def to_int64_tuple(tensor: torch.Tensor) -> tuple[int, ...]:
@@ -208,28 +395,101 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
 
         # 1.2: Process the remaining part
-        if attn_metadata.num_prefills > 0:
-            if mixed_qkv_non_spec is not None:
-                conv_weights_T = conv_weights.transpose(0, 1)
-                activation_num = 1 if self.activation else 0
-                (
-                    query_start_loc_opt,
-                    cache_indices_opt,
-                    initial_state_mode_opt,
-                ) = get_non_spec_causal_conv1d_host_args(attn_metadata)
-                mixed_qkv_non_spec = torch.ops._C_ascend.npu_causal_conv1d_custom(
-                    mixed_qkv_non_spec,
-                    conv_weights_T,
-                    conv_state=self_kv_cache[0],
-                    bias_opt=self.conv1d.bias,
-                    query_start_loc_opt=query_start_loc_opt,
-                    cache_indices_opt=cache_indices_opt,
-                    initial_state_mode_opt=initial_state_mode_opt,
-                    num_accepted_tokens_opt=[],
-                    activation_mode=activation_num,
-                    pad_slot_id=PAD_SLOT_ID,
-                    run_mode=0,
+        is_all_mode = getattr(attn_metadata, 'is_all_mode', False)
+        if is_all_mode and mixed_qkv_non_spec is not None:
+            # All-mode prefix caching: use Triton fwd kernel for prefill,
+            # decode kernel with APC params for decode
+            num_decodes = attn_metadata.num_decodes
+            num_prefills = attn_metadata.num_prefills
+
+            if num_prefills > 0:
+                # Compute SOURCE block index for conv state initial state.
+                # Kernel expects block INDEX (not pool slot) into block_table_2d.
+                num_comp = attn_metadata.num_computed_tokens_all
+                initial_state_idx = torch.where(
+                    num_comp > 0,
+                    (num_comp - 1) // attn_metadata.mamba_block_size,
+                    torch.zeros_like(num_comp),  # placeholder; has_initial_state=False skips read
                 )
+                # Prefill: Triton causal_conv1d_fwd_npu with APC params
+                mixed_qkv_non_spec = causal_conv1d_fwd_npu(
+                    x=mixed_qkv_non_spec,
+                    weight=conv_weights,
+                    bias=self.conv1d.bias,
+                    conv_states=conv_state,
+                    query_start_loc=non_spec_query_start_loc,
+                    cache_indices=attn_metadata.block_table_2d,
+                    has_initial_state=has_initial_state,
+                    activation=self.activation,
+                    pad_slot_id=PAD_SLOT_ID,
+                    block_idx_first_scheduled_token=(
+                        attn_metadata.block_idx_first_scheduled_token),
+                    block_idx_last_scheduled_token=(
+                        attn_metadata.block_idx_last_scheduled_token),
+                    initial_state_idx=initial_state_idx,
+                    num_computed_tokens=(
+                        attn_metadata.num_computed_tokens_all),
+                    block_size_to_align=attn_metadata.mamba_block_size,
+                )
+            elif num_decodes > 0:
+                # Decode-only: pre-copy conv state SOURCE → DEST
+                src_slots = attn_metadata.block_state_indices[:num_decodes]
+                dst_slots = non_spec_state_indices_tensor[:num_decodes]
+                need_copy = (src_slots >= 0) & (dst_slots >= 0) & (
+                    src_slots != dst_slots)
+                if need_copy.any():
+                    conv_state[dst_slots[need_copy].long()] = (
+                        conv_state[src_slots[need_copy].long()])
+                mixed_qkv_non_spec = causal_conv1d_update_npu(
+                    mixed_qkv_non_spec,
+                    conv_state,
+                    conv_weights,
+                    self.conv1d.bias,
+                    self.activation,
+                    conv_state_indices=non_spec_state_indices_tensor[
+                        : attn_metadata.num_actual_tokens],
+                    validate_data=True,
+                )
+            else:
+                mixed_qkv_non_spec = None
+        elif attn_metadata.num_prefills > 0:
+            if mixed_qkv_non_spec is not None:
+                if _ALIGN_TRITON_CONV1D:
+                    # Triton conv1d for align-mode (fair benchmark vs all-mode).
+                    # Same kernel as all-mode with IS_APC_ENABLED=False.
+                    # 1D cache_indices works: stride=1, init/last_index=0 → SOURCE==DEST.
+                    mixed_qkv_non_spec = causal_conv1d_fwd_npu(
+                        x=mixed_qkv_non_spec,
+                        weight=conv_weights,
+                        bias=self.conv1d.bias,
+                        conv_states=conv_state,
+                        query_start_loc=non_spec_query_start_loc,
+                        cache_indices=non_spec_state_indices_tensor,
+                        has_initial_state=has_initial_state,
+                        activation=self.activation,
+                        pad_slot_id=PAD_SLOT_ID,
+                    )
+                else:
+                    conv_weights_T = conv_weights.transpose(0, 1)
+                    activation_num = 1 if self.activation else 0
+                    (
+                        query_start_loc_opt,
+                        cache_indices_opt,
+                        initial_state_mode_opt,
+                    ) = get_non_spec_causal_conv1d_host_args(attn_metadata)
+                    mixed_qkv_non_spec = torch.ops._C_ascend.npu_causal_conv1d_custom(
+                        mixed_qkv_non_spec,
+                        conv_weights_T,
+                        conv_state=self_kv_cache[0],
+                        bias_opt=self.conv1d.bias,
+                        query_start_loc_opt=query_start_loc_opt,
+                        cache_indices_opt=cache_indices_opt,
+                        initial_state_mode_opt=initial_state_mode_opt,
+                        num_accepted_tokens_opt=[],
+                        activation_mode=activation_num,
+                        pad_slot_id=PAD_SLOT_ID,
+                        run_mode=0,
+                    )
         elif attn_metadata.num_decodes > 0:
             mixed_qkv_non_spec = causal_conv1d_update_npu(
                 mixed_qkv_non_spec,
@@ -290,10 +550,70 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 core_attn_out_spec, last_recurrent_state = None, None
 
             # 2.2: Process the remaining part
-            if attn_metadata.num_prefills > 0:
+            if is_all_mode and attn_metadata.num_prefills > 0:
+                # All-mode: read SOURCE, run chunk kernel with intermediate
+                # states, write DEST + scatter intermediate block states
+                # Qwen3Next: pool [V,K] ↔ kernel [K,V] → transpose_state=True
+                initial_state = _build_initial_state(
+                    ssm_state, attn_metadata,
+                    attn_metadata.num_decodes, attn_metadata.num_prefills,
+                    transpose_state=True)
+                (core_attn_out_non_spec, last_recurrent_state, chunk_history) = (
+                    chunk_gated_delta_rule(
+                        q=query_non_spec,
+                        k=key_non_spec,
+                        v=value_non_spec,
+                        g=g_non_spec,
+                        beta=beta_non_spec,
+                        initial_state=initial_state,
+                        output_final_state=True,
+                        cu_seqlens=non_spec_query_start_loc,
+                        prebuilt_meta=get_non_spec_chunked_prefill_meta(
+                            attn_metadata),
+                        head_first=False,
+                        use_qk_l2norm_in_kernel=True,
+                        return_intermediate_states=True,
+                        state_dtype=ssm_state.dtype,
+                    ))
+                _write_final_states(
+                    ssm_state, last_recurrent_state, attn_metadata,
+                    attn_metadata.num_decodes, transpose_state=True)
+                if chunk_history is not None:
+                    # FLA returns h as [B=1, NT, H, K, V]; squeeze batch dim
+                    _scatter_intermediate_states(
+                        ssm_state, chunk_history.squeeze(0), attn_metadata,
+                        attn_metadata.num_decodes, transpose_state=True)
+            elif is_all_mode and attn_metadata.num_decodes > 0:
+                # All-mode decode-only: pre-copy SOURCE → DEST, then
+                # in-place recurrent kernel reads/writes via DEST slots.
+                # Qwen3Next: pool [V,K], no transpose needed for pre-copy
+                # (same layout in pool, just different slots)
+                src_slots = attn_metadata.block_state_indices
+                dst_slots = non_spec_state_indices_tensor
+                need_copy = (src_slots >= 0) & (dst_slots >= 0) & (
+                    src_slots != dst_slots)
+                if need_copy.any():
+                    ssm_state[dst_slots[need_copy].long()] = (
+                        ssm_state[src_slots[need_copy].long()])
+                cu_seqlens = non_spec_query_start_loc[: attn_metadata.num_decodes + 1]
+                actual_seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+                query_non_spec = l2norm_fwd(query_non_spec)
+                key_non_spec = l2norm_fwd(key_non_spec)
+                core_attn_out_non_spec = torch_npu.npu_recurrent_gated_delta_rule(
+                    query=query_non_spec.squeeze(0),
+                    key=key_non_spec.squeeze(0),
+                    value=value_non_spec.squeeze(0),
+                    g=g_non_spec.squeeze(0) if g_non_spec is not None else g_non_spec,
+                    beta=beta_non_spec.squeeze(0) if beta_non_spec is not None else beta_non_spec,
+                    state=ssm_state,
+                    scale=key_non_spec.shape[-1] ** -0.5,
+                    actual_seq_lengths=actual_seq_lengths,
+                    ssm_state_indices=non_spec_state_indices_tensor,
+                ).unsqueeze(0)
+            elif attn_metadata.num_prefills > 0:
                 initial_state = ssm_state[non_spec_state_indices_tensor].transpose(-1, -2).contiguous()
                 clear_ssm_states(initial_state, has_initial_state)
-                (core_attn_out_non_spec, last_recurrent_state) = chunk_gated_delta_rule(
+                (core_attn_out_non_spec, last_recurrent_state, _) = chunk_gated_delta_rule(
                     q=query_non_spec,
                     k=key_non_spec,
                     v=value_non_spec,
@@ -368,10 +688,66 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     core_attn_out_spec, last_recurrent_state = None, None
 
                 # 2.2: Process the remaining part
-                if attn_metadata.num_prefills > 0:
+                if is_all_mode and attn_metadata.num_prefills > 0:
+                    # All-mode: Qwen3.5 pool [K,V] == kernel [K,V] → no transpose
+                    initial_state = _build_initial_state(
+                        ssm_state, attn_metadata,
+                        attn_metadata.num_decodes, attn_metadata.num_prefills,
+                        transpose_state=False)
+                    (core_attn_out_non_spec, last_recurrent_state, chunk_history) = (
+                        chunk_gated_delta_rule(
+                            q=query_non_spec,
+                            k=key_non_spec,
+                            v=value_non_spec,
+                            g=g_non_spec,
+                            beta=beta_non_spec,
+                            initial_state=initial_state,
+                            output_final_state=True,
+                            cu_seqlens=non_spec_query_start_loc,
+                            prebuilt_meta=get_non_spec_chunked_prefill_meta(
+                                attn_metadata),
+                            head_first=False,
+                            use_qk_l2norm_in_kernel=True,
+                            return_intermediate_states=True,
+                            state_dtype=ssm_state.dtype,
+                        ))
+                    _write_final_states(
+                        ssm_state, last_recurrent_state, attn_metadata,
+                        attn_metadata.num_decodes, transpose_state=False)
+                    if chunk_history is not None:
+                        # FLA returns h as [B=1, NT, H, K, V]; squeeze batch dim
+                        _scatter_intermediate_states(
+                            ssm_state, chunk_history.squeeze(0), attn_metadata,
+                            attn_metadata.num_decodes, transpose_state=False)
+                elif is_all_mode and attn_metadata.num_decodes > 0:
+                    # All-mode decode-only: pre-copy SOURCE → DEST, then
+                    # in-place fused_recurrent reads/writes via DEST slots.
+                    # Qwen3.5: pool [K,V], no transpose for pre-copy
+                    src_slots = attn_metadata.block_state_indices
+                    dst_slots = non_spec_state_indices_tensor
+                    need_copy = (src_slots >= 0) & (dst_slots >= 0) & (
+                        src_slots != dst_slots)
+                    if need_copy.any():
+                        ssm_state[dst_slots[need_copy].long()] = (
+                            ssm_state[src_slots[need_copy].long()])
+                    core_attn_out_non_spec, last_recurrent_state = (
+                        fused_recurrent_gated_delta_rule(
+                            q=query_non_spec,
+                            k=key_non_spec,
+                            v=value_non_spec,
+                            g=g_non_spec,
+                            beta=beta_non_spec,
+                            initial_state=ssm_state,
+                            inplace_final_state=True,
+                            cu_seqlens=non_spec_query_start_loc[
+                                : attn_metadata.num_decodes + 1],
+                            ssm_state_indices=non_spec_state_indices_tensor,
+                            use_qk_l2norm_in_kernel=True,
+                        ))
+                elif attn_metadata.num_prefills > 0:
                     initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()
                     clear_ssm_states(initial_state, has_initial_state)
-                    (core_attn_out_non_spec, last_recurrent_state) = chunk_gated_delta_rule(
+                    (core_attn_out_non_spec, last_recurrent_state, _) = chunk_gated_delta_rule(
                         q=query_non_spec,
                         k=key_non_spec,
                         v=value_non_spec,
@@ -402,6 +778,15 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     core_attn_out_non_spec, last_recurrent_state = None, None
             elif attn_metadata.num_decodes > 0:
                 core_attn_out_spec = None
+                # All-mode: pre-copy SOURCE → DEST before in-place kernel
+                if is_all_mode:
+                    src_slots = attn_metadata.block_state_indices
+                    dst_slots = non_spec_state_indices_tensor
+                    need_copy = (src_slots >= 0) & (dst_slots >= 0) & (
+                        src_slots != dst_slots)
+                    if need_copy.any():
+                        ssm_state[dst_slots[need_copy].long()] = (
+                            ssm_state[src_slots[need_copy].long()])
                 core_attn_out_non_spec = fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log.contiguous(),
                     dt_bias=self.dt_bias.contiguous(),
