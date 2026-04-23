@@ -59,6 +59,24 @@ from vllm_ascend.utils import enable_sp
 # ──────────────────────────────────────────────────────────────────
 
 
+def _nonzero_flat(mask: torch.Tensor) -> torch.Tensor:
+    return torch.nonzero(mask, as_tuple=False).flatten()
+
+
+def _copy_slots_if_needed(
+    state_pool: torch.Tensor,
+    src_slots: torch.Tensor,
+    dst_slots: torch.Tensor,
+) -> None:
+    copy_idx = _nonzero_flat((src_slots >= 0) & (dst_slots >= 0) & (src_slots != dst_slots))
+    if copy_idx.numel() == 0:
+        return
+
+    src = src_slots.index_select(0, copy_idx).long()
+    dst = dst_slots.index_select(0, copy_idx).long()
+    state_pool[dst] = state_pool[src]
+
+
 def _build_initial_state(
     ssm_state: torch.Tensor,
     metadata,
@@ -91,21 +109,21 @@ def _build_initial_state(
 
     if num_decodes > 0:
         d_slots = source_slots[:num_decodes]
-        valid = d_slots >= 0
-        if valid.any():
-            state = ssm_state[d_slots[valid].long()]
+        valid_idx = _nonzero_flat(d_slots >= 0)
+        if valid_idx.numel() > 0:
+            state = ssm_state[d_slots.index_select(0, valid_idx).long()]
             if transpose_state:
                 state = state.transpose(-1, -2).contiguous()
-            initial[:num_decodes][valid] = state
+            initial.index_copy_(0, valid_idx, state)
 
     if num_prefills > 0:
         p_slots = source_slots[num_decodes:]
-        valid = p_slots >= 0
-        if valid.any():
-            state = ssm_state[p_slots[valid].long()]
+        valid_idx = _nonzero_flat(p_slots >= 0)
+        if valid_idx.numel() > 0:
+            state = ssm_state[p_slots.index_select(0, valid_idx).long()]
             if transpose_state:
                 state = state.transpose(-1, -2).contiguous()
-            initial[num_decodes:][valid] = state
+            initial.index_copy_(0, valid_idx + num_decodes, state)
         # Zero out prefill seqs without initial state
         has_init = metadata.has_initial_state
         if has_init is not None:
@@ -137,22 +155,22 @@ def _write_final_states(
 
     if num_decodes > 0:
         d_dest = dest_slots[:num_decodes]
-        valid = d_dest >= 0
-        if valid.any():
-            state = final_state[:num_decodes][valid].to(ssm_state.dtype)
+        valid_idx = _nonzero_flat(d_dest >= 0)
+        if valid_idx.numel() > 0:
+            state = final_state[:num_decodes].index_select(0, valid_idx).to(ssm_state.dtype)
             if transpose_state:
                 state = state.transpose(-1, -2).contiguous()
-            ssm_state[d_dest[valid].long()] = state
+            ssm_state[d_dest.index_select(0, valid_idx).long()] = state
 
     num_prefills = final_state.shape[0] - num_decodes
     if num_prefills > 0:
         p_dest = dest_slots[num_decodes:]
-        valid = p_dest >= 0
-        if valid.any():
-            state = final_state[num_decodes:][valid].to(ssm_state.dtype)
+        valid_idx = _nonzero_flat(p_dest >= 0)
+        if valid_idx.numel() > 0:
+            state = final_state[num_decodes:].index_select(0, valid_idx).to(ssm_state.dtype)
             if transpose_state:
                 state = state.transpose(-1, -2).contiguous()
-            ssm_state[p_dest[valid].long()] = state
+            ssm_state[p_dest.index_select(0, valid_idx).long()] = state
 
 
 
@@ -165,8 +183,9 @@ def _scatter_intermediate_states(
 ) -> None:
     """Write intermediate block boundary states from chunk_history to pool.
 
-    Only processes prefill sequences (decode seqs span at most 1 block).
-    Uses prefill_chunk_offsets to locate each prefill's chunks in h tensor.
+    Metadata builder precomputes a flattened scatter plan:
+    - scatter_src_indices_tensor: indices into chunk_history
+    - scatter_dst_slots_tensor: destination pool slots in ssm_state
 
     Args:
         ssm_state: Pool tensor [N_pool, H, K/V, V/K]
@@ -175,54 +194,25 @@ def _scatter_intermediate_states(
         num_decodes: Number of decode sequences
         transpose_state: If True, transpose kernel [K,V]->[V,K] for pool
     """
-    block_size = metadata.mamba_block_size
-    chunk_size = metadata.all_mode_chunk_size
-    chunks_per_block = block_size // chunk_size
+    del num_decodes
 
-    prefill_chunk_start = metadata.prefill_chunk_start
-    prefill_offsets = metadata.prefill_chunk_offsets  # [num_prefills + 1]
-    if prefill_offsets is None:
+    src_indices = getattr(metadata, "scatter_src_indices_tensor", None)
+    dst_slots = getattr(metadata, "scatter_dst_slots_tensor", None)
+    if src_indices is None or dst_slots is None or src_indices.numel() == 0:
         return
-    num_prefills = len(prefill_offsets) - 1
 
-    block_table = metadata.block_table_2d[num_decodes:]
-    first_sched = metadata.block_idx_first_scheduled_token[num_decodes:]
-    last_sched = metadata.block_idx_last_scheduled_token[num_decodes:]
-    num_comp = metadata.num_computed_tokens_all[num_decodes:]
-
-    for seq_idx in range(num_prefills):
-        chunk_start = prefill_offsets[seq_idx].item()
-        block_first = first_sched[seq_idx].item()
-        block_last = last_sched[seq_idx].item()
-        n_blocks = block_last - block_first
-        if n_blocks <= 0:
-            continue
-
-        cache_slots = block_table[seq_idx, block_first:block_last]
-        valid = cache_slots >= 0
-
-        # Compute aligned chunk index in h tensor
-        first_chunk = prefill_chunk_start + chunk_start
-        first_aligned_chunk = first_chunk + chunks_per_block
-
-        num_unaligned = num_comp[seq_idx].item() % block_size
-        assert num_unaligned == 0, (
-            f"Scheduler must guarantee block-aligned context: "
-            f"context_len={num_comp[seq_idx].item()}, "
-            f"block_size={block_size}"
+    write_states = chunk_history.index_select(0, src_indices.long()).to(ssm_state.dtype)
+    if dst_slots.numel() != write_states.shape[0]:
+        raise RuntimeError(
+            "Scatter plan mismatch: scatter_dst_slots_tensor and gathered "
+            "chunk_history rows must have the same length."
         )
+    if write_states.numel() == 0:
+        return
 
-        states = chunk_history[
-            first_aligned_chunk:
-            first_aligned_chunk + n_blocks * chunks_per_block:
-            chunks_per_block
-        ]
-
-        write_states = states[:valid.sum()].to(ssm_state.dtype)
-        if transpose_state:
-            write_states = write_states.transpose(-1, -2).contiguous()
-        ssm_state[cache_slots[valid].long()] = write_states
-
+    if transpose_state:
+        write_states = write_states.transpose(-1, -2).contiguous()
+    ssm_state[dst_slots.long()] = write_states
     return
 
 
@@ -435,11 +425,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 # Decode-only: pre-copy conv state SOURCE → DEST
                 src_slots = attn_metadata.block_state_indices[:num_decodes]
                 dst_slots = non_spec_state_indices_tensor[:num_decodes]
-                need_copy = (src_slots >= 0) & (dst_slots >= 0) & (
-                    src_slots != dst_slots)
-                if need_copy.any():
-                    conv_state[dst_slots[need_copy].long()] = (
-                        conv_state[src_slots[need_copy].long()])
+                _copy_slots_if_needed(conv_state, src_slots, dst_slots)
                 mixed_qkv_non_spec = causal_conv1d_update_npu(
                     mixed_qkv_non_spec,
                     conv_state,
@@ -590,11 +576,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 # (same layout in pool, just different slots)
                 src_slots = attn_metadata.block_state_indices
                 dst_slots = non_spec_state_indices_tensor
-                need_copy = (src_slots >= 0) & (dst_slots >= 0) & (
-                    src_slots != dst_slots)
-                if need_copy.any():
-                    ssm_state[dst_slots[need_copy].long()] = (
-                        ssm_state[src_slots[need_copy].long()])
+                _copy_slots_if_needed(ssm_state, src_slots, dst_slots)
                 cu_seqlens = non_spec_query_start_loc[: attn_metadata.num_decodes + 1]
                 actual_seq_lengths = cu_seqlens[1:] - cu_seqlens[:-1]
                 query_non_spec = l2norm_fwd(query_non_spec)
@@ -725,11 +707,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                     # Qwen3.5: pool [K,V], no transpose for pre-copy
                     src_slots = attn_metadata.block_state_indices
                     dst_slots = non_spec_state_indices_tensor
-                    need_copy = (src_slots >= 0) & (dst_slots >= 0) & (
-                        src_slots != dst_slots)
-                    if need_copy.any():
-                        ssm_state[dst_slots[need_copy].long()] = (
-                            ssm_state[src_slots[need_copy].long()])
+                    _copy_slots_if_needed(ssm_state, src_slots, dst_slots)
                     core_attn_out_non_spec, last_recurrent_state = (
                         fused_recurrent_gated_delta_rule(
                             q=query_non_spec,
@@ -782,11 +760,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 if is_all_mode:
                     src_slots = attn_metadata.block_state_indices
                     dst_slots = non_spec_state_indices_tensor
-                    need_copy = (src_slots >= 0) & (dst_slots >= 0) & (
-                        src_slots != dst_slots)
-                    if need_copy.any():
-                        ssm_state[dst_slots[need_copy].long()] = (
-                            ssm_state[src_slots[need_copy].long()])
+                    _copy_slots_if_needed(ssm_state, src_slots, dst_slots)
                 core_attn_out_non_spec = fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log.contiguous(),
                     dt_bias=self.dt_bias.contiguous(),

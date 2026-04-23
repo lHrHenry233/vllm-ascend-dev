@@ -623,10 +623,16 @@ def _compute_all_mode_metadata(builder, attn_metadata, m):
 
     # Prefill chunk computation for intermediate state scatter
     # Each decode seq contributes 1 chunk to the FLA h tensor
+    chunks_per_block = block_size // chunk_size
     prefill_chunk_start = num_decodes
     prefill_chunk_offsets = None
+    scatter_src_indices = torch.empty(0, dtype=torch.long, device=device)
+    scatter_dst_slots = torch.empty(0, dtype=torch.long, device=device)
     if num_prefills > 0:
         prefill_query_lens = query_lens[num_decodes:]
+        prefill_context_lens = context_lens[num_decodes:]
+        prefill_block_first = block_idx_first_scheduled[num_decodes:]
+        prefill_block_last = block_idx_last_scheduled[num_decodes:]
         prefill_chunk_counts = (
             (prefill_query_lens + chunk_size - 1) // chunk_size
         )
@@ -635,6 +641,54 @@ def _compute_all_mode_metadata(builder, attn_metadata, m):
         )
         torch.cumsum(prefill_chunk_counts, dim=0, out=offsets[1:])
         prefill_chunk_offsets = offsets
+
+        unaligned_prefills = torch.nonzero(
+            prefill_context_lens.remainder(block_size) != 0,
+            as_tuple=False,
+        ).flatten()
+        if unaligned_prefills.numel() > 0:
+            bad_idx = int(unaligned_prefills[0].item())
+            raise AssertionError(
+                "Scheduler must guarantee block-aligned context for all-mode "
+                f"scatter: seq_idx={bad_idx}, "
+                f"context_len={int(prefill_context_lens[bad_idx].item())}, "
+                f"block_size={block_size}"
+            )
+
+        scatter_counts = torch.clamp(
+            prefill_block_last - prefill_block_first,
+            min=0,
+        ).to(torch.long)
+        scatter_seq_ids = torch.repeat_interleave(
+            torch.arange(num_prefills, device=device, dtype=torch.long),
+            scatter_counts,
+        )
+        if scatter_seq_ids.numel() > 0:
+            scatter_prefix = torch.cumsum(scatter_counts, dim=0) - scatter_counts
+            local_offsets = (
+                torch.arange(scatter_seq_ids.numel(), device=device, dtype=torch.long)
+                - torch.repeat_interleave(scatter_prefix, scatter_counts)
+            )
+            scatter_rows = block_table_2d[num_decodes:].index_select(0, scatter_seq_ids)
+            scatter_block_indices = (
+                prefill_block_first.to(torch.long).index_select(0, scatter_seq_ids)
+                + local_offsets
+            )
+            scatter_dst_slots = scatter_rows.gather(
+                1, scatter_block_indices.unsqueeze(1)
+            ).squeeze(1).to(torch.long)
+            scatter_src_indices = (
+                prefill_chunk_offsets[:-1].index_select(0, scatter_seq_ids)
+                + prefill_chunk_start
+                + (local_offsets + 1) * chunks_per_block
+            )
+            valid_scatter = torch.nonzero(
+                scatter_dst_slots >= 0,
+                as_tuple=False,
+            ).flatten()
+            if valid_scatter.numel() != scatter_dst_slots.numel():
+                scatter_dst_slots = scatter_dst_slots.index_select(0, valid_scatter)
+                scatter_src_indices = scatter_src_indices.index_select(0, valid_scatter)
 
     attn_metadata.is_all_mode = True
     attn_metadata.mamba_block_size = block_size
@@ -647,6 +701,8 @@ def _compute_all_mode_metadata(builder, attn_metadata, m):
     attn_metadata.num_computed_tokens_all = context_lens
     attn_metadata.prefill_chunk_start = prefill_chunk_start
     attn_metadata.prefill_chunk_offsets = prefill_chunk_offsets
+    attn_metadata.scatter_src_indices_tensor = scatter_src_indices
+    attn_metadata.scatter_dst_slots_tensor = scatter_dst_slots
 
     # Clean block-level debug: one line per step showing scheduling behavior
     if _GDN_DEBUG and num_prefills > 0:
