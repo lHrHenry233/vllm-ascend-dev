@@ -65,12 +65,12 @@ class LocalOpenAIServer:
             "--gpu-memory-utilization",
             str(self.args.gpu_memory_utilization),
             "--enable-prefix-caching",
+            "--mamba-cache-mode",
+            self.mode,
             "--max-model-len",
             str(self.args.max_model_len),
             "--max-num-batched-tokens",
             str(self.args.max_num_batched_tokens),
-            "--override-generation-config",
-            json.dumps({"mamba_cache_mode": self.mode}),
         ]
         if self.args.served_model_name:
             cmd.extend(["--served-model-name", self.args.served_model_name])
@@ -87,11 +87,14 @@ class LocalOpenAIServer:
         self.log_file = self.log_path.open("w")
         cmd = self._build_command()
         print(f"\n>>> Starting online server for {self.mode}: {' '.join(cmd)}")
+        env = os.environ.copy()
+        if self.args.align_triton_conv1d:
+            env["GDN_ALIGN_TRITON_CONV1D"] = "1"
         self.proc = subprocess.Popen(
             cmd,
             stdout=self.log_file,
             stderr=subprocess.STDOUT,
-            env=os.environ.copy(),
+            env=env,
         )
 
         deadline = time.time() + self.args.startup_timeout
@@ -338,6 +341,11 @@ def main():
     )
     parser.add_argument("--served-model-name", type=str, default=None)
     parser.add_argument("--results-dir", type=str, default=None)
+    parser.add_argument(
+        "--align-triton-conv1d",
+        action="store_true",
+        help="Set GDN_ALIGN_TRITON_CONV1D=1 for the server process so ALIGN uses the Triton conv1d path.",
+    )
     args = parser.parse_args()
 
     model_path = args.model
