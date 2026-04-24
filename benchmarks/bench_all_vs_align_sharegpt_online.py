@@ -229,6 +229,33 @@ def load_or_build_groups(args: argparse.Namespace, model_path: str):
     return all_groups
 
 
+def _measure_pair_online(server: LocalOpenAIServer, pair: dict, max_gen_tokens: int):
+    t0 = time.perf_counter()
+    r1_text = server.generate(pair["r1_prompt"], max_gen_tokens)
+    t1 = time.perf_counter()
+
+    t2 = time.perf_counter()
+    r2_text = server.generate(pair["r2_prompt"], max_gen_tokens)
+    t3 = time.perf_counter()
+
+    return {
+        "r1_ms": (t1 - t0) * 1000,
+        "r2_ms": (t3 - t2) * 1000,
+        "r1_output": r1_text,
+        "r2_output": r2_text,
+    }
+
+
+def _warmup_mode_online(mode: str, all_groups: dict[int, list[dict]], model_path: str, max_gen_tokens: int,
+                        args: argparse.Namespace, results_dir: Path):
+    pair = offline_base._first_pair(all_groups)
+    warmup_dir = results_dir / f"{mode}_warmup"
+    print(f"\n  Warmup ({mode}, online): compile on one prompt pair using a disposable server")
+    with LocalOpenAIServer(mode, model_path, args, warmup_dir) as server:
+        server.generate(pair["r1_prompt"], max_gen_tokens)
+        server.generate(pair["r2_prompt"], max_gen_tokens)
+
+
 def run_one_mode_online(
     mode: str,
     all_groups: dict[int, list[dict]],
@@ -240,66 +267,62 @@ def run_one_mode_online(
     print(f"\n{'═' * 70}")
     print(f"  MODE: {mode} (online)")
     print(f"  Groups: {sorted(all_groups.keys())} blocks")
-    print(f"  Iterations per conversation: {args.num_iters}")
+    print(f"  Measured repeats (fresh server): {args.num_repeats}")
+    print(f"  Warmup server: {'on' if not args.skip_warmup else 'off'}")
+    print(f"  ALIGN Triton conv1d: {'on' if args.align_triton_conv1d else 'off'}")
+    print(f"  max_tokens = {max_gen_tokens}")
     print(f"{'═' * 70}")
 
+    if not args.skip_warmup:
+        _warmup_mode_online(mode, all_groups, model_path, max_gen_tokens, args, results_dir)
+
     results = {}
-    with LocalOpenAIServer(mode, model_path, args, results_dir) as server:
-        for target_blocks in sorted(all_groups.keys()):
-            pairs = all_groups[target_blocks]
+    for target_blocks in sorted(all_groups.keys()):
+        pairs = all_groups[target_blocks]
+        results[target_blocks] = [
+            {
+                "conv_idx": pair["conv_idx"],
+                "prefix_tokens": pair["prefix_tokens"],
+                "prefix_blocks": pair["prefix_blocks"],
+                "r1_all_ms": [],
+                "r2_all_ms": [],
+                "r1_output": None,
+                "r2_output": None,
+            }
+            for pair in pairs
+        ]
+
+    for repeat_idx in range(args.num_repeats):
+        print(f"\n  [Repeat {repeat_idx + 1}/{args.num_repeats}] Starting fresh server")
+        repeat_dir = results_dir / f"{mode}_repeat{repeat_idx + 1}"
+        with LocalOpenAIServer(mode, model_path, args, repeat_dir) as server:
+            for target_blocks in sorted(all_groups.keys()):
+                pairs = all_groups[target_blocks]
+                for p_idx, pair in enumerate(pairs):
+                    measured = _measure_pair_online(server, pair, max_gen_tokens)
+                    conv_result = results[target_blocks][p_idx]
+                    conv_result["r1_all_ms"].append(measured["r1_ms"])
+                    conv_result["r2_all_ms"].append(measured["r2_ms"])
+                    if repeat_idx == 0:
+                        conv_result["r1_output"] = measured["r1_output"]
+                        conv_result["r2_output"] = measured["r2_output"]
+
+    for target_blocks in sorted(results.keys()):
+        print(
+            f"\n  ── Group: {target_blocks} blocks "
+            f"({target_blocks * offline_base.BLOCK_SIZE} tokens) "
+            f"── {len(results[target_blocks])} conversations ──"
+        )
+        for p_idx, conv_result in enumerate(results[target_blocks]):
+            conv_result["r1_mean_ms"] = statistics.mean(conv_result["r1_all_ms"])
+            conv_result["r2_mean_ms"] = statistics.mean(conv_result["r2_all_ms"])
+            speedup = conv_result["r1_mean_ms"] / max(conv_result["r2_mean_ms"], 0.1)
             print(
-                f"\n  ── Group: {target_blocks} blocks "
-                f"({target_blocks * offline_base.BLOCK_SIZE} tokens) "
-                f"── {len(pairs)} conversations ──"
+                f"    conv[{p_idx}]: prefix={conv_result['prefix_tokens']}tok "
+                f"R1={conv_result['r1_mean_ms']:.0f}ms "
+                f"R2={conv_result['r2_mean_ms']:.0f}ms "
+                f"(R1/R2={speedup:.1f}x)"
             )
-
-            group_results = []
-            for p_idx, pair in enumerate(pairs):
-                r1_times = []
-                r2_times = []
-                r1_output = None
-                r2_output = None
-
-                for it in range(args.num_iters):
-                    t0 = time.perf_counter()
-                    r1_text = server.generate(pair["r1_prompt"], max_gen_tokens)
-                    t1 = time.perf_counter()
-                    r1_times.append((t1 - t0) * 1000)
-
-                    t2 = time.perf_counter()
-                    r2_text = server.generate(pair["r2_prompt"], max_gen_tokens)
-                    t3 = time.perf_counter()
-                    r2_times.append((t3 - t2) * 1000)
-
-                    if it == 0:
-                        r1_output = r1_text
-                        r2_output = r2_text
-
-                r2_warm = r2_times[1:] if len(r2_times) > 1 else r2_times
-                r1_warm = r1_times[1:] if len(r1_times) > 1 else r1_times
-
-                conv_result = {
-                    "conv_idx": pair["conv_idx"],
-                    "prefix_tokens": pair["prefix_tokens"],
-                    "prefix_blocks": pair["prefix_blocks"],
-                    "r1_all_ms": r1_times,
-                    "r2_all_ms": r2_times,
-                    "r1_mean_ms": statistics.mean(r1_warm),
-                    "r2_mean_ms": statistics.mean(r2_warm),
-                    "r1_output": r1_output,
-                    "r2_output": r2_output,
-                }
-                group_results.append(conv_result)
-
-                speedup = conv_result["r1_mean_ms"] / max(conv_result["r2_mean_ms"], 0.1)
-                print(
-                    f"    conv[{p_idx}]: prefix={pair['prefix_tokens']}tok "
-                    f"R1={conv_result['r1_mean_ms']:.0f}ms "
-                    f"R2={conv_result['r2_mean_ms']:.0f}ms "
-                    f"(R1/R2={speedup:.1f}x)"
-                )
-
-            results[target_blocks] = group_results
 
     return results
 
@@ -311,7 +334,7 @@ def main():
     )
     parser.add_argument("--groups", type=int, nargs="+", default=offline_base.DEFAULT_GROUPS)
     parser.add_argument("--convs-per-group", type=int, default=5)
-    parser.add_argument("--num-iters", type=int, default=3)
+    parser.add_argument("--num-repeats", "--num-iters", dest="num_repeats", type=int, default=1)
     parser.add_argument("--max-tokens", type=int, default=offline_base.MAX_GEN_TOKENS)
     parser.add_argument("--data-path", type=str, default=None)
     parser.add_argument("--mode", choices=["all", "align", "both"], default="both")
@@ -346,6 +369,11 @@ def main():
         action="store_true",
         help="Set GDN_ALIGN_TRITON_CONV1D=1 for the server process so ALIGN uses the Triton conv1d path.",
     )
+    parser.add_argument(
+        "--skip-warmup",
+        action="store_true",
+        help="Skip the disposable warmup server that compiles kernels before measured repeats.",
+    )
     args = parser.parse_args()
 
     model_path = args.model
@@ -376,7 +404,7 @@ def main():
         align_results = run_one_mode_online("align", all_groups, model_path, max_gen_tokens, args, results_dir)
 
     if all_results and align_results:
-        offline_base.print_report(all_results, align_results, args.groups, model_path)
+        offline_base.print_report(all_results, align_results, args.groups, model_path, max_gen_tokens)
     elif all_results:
         print("\n  Only all-mode results available.")
         for blk, group in all_results.items():

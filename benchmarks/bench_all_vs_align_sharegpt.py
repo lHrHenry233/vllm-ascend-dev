@@ -26,14 +26,14 @@ With max_num_batched_tokens=4096 and block_size=1024 (alignment=4):
   Group 10 blocks: ALL hits 10, ALIGN hits 8 → 2048 tokens extra recompute
 
 Usage:
-  # Full benchmark (default: 4 groups, 5 convs each, 3 iters)
+  # Full benchmark (default: 4 groups, 5 convs each, 1 measured repeat)
   python benchmarks/bench_all_vs_align_sharegpt.py
 
   # Specific groups
   python benchmarks/bench_all_vs_align_sharegpt.py --groups 3 5
 
-  # More conversations / iterations
-  python benchmarks/bench_all_vs_align_sharegpt.py --convs-per-group 10 --num-iters 5
+  # More conversations / measured repeats
+  python benchmarks/bench_all_vs_align_sharegpt.py --convs-per-group 10 --num-repeats 3
 
   # Dry run (construct prompts, print stats, no engine needed)
   python benchmarks/bench_all_vs_align_sharegpt.py --dry-run
@@ -45,6 +45,13 @@ Usage:
   python benchmarks/bench_all_vs_align_sharegpt.py \
     --load-prompts /path/to/sharegpt_prompts.json \
     --model /data/Qwen3.5-9B
+
+  # Fair ALIGN Triton comparison with TTFT-friendly decoding
+  python benchmarks/bench_all_vs_align_sharegpt.py \
+    --mode both \
+    --align-triton-conv1d \
+    --max-tokens 1 \
+    --load-prompts /path/to/sharegpt_prompts.json
 
   # Single mode
   python benchmarks/bench_all_vs_align_sharegpt.py --mode all
@@ -83,7 +90,7 @@ SHAREGPT_FILENAME = "sharegpt_v3_cleaned.json"
 MODEL = os.environ.get("MODEL", "/data/Qwen3.5-9B")
 BLOCK_SIZE = 1024
 SUFFIX_TARGET_TOKENS = 300
-MAX_GEN_TOKENS = 50
+MAX_GEN_TOKENS = 1
 
 ENGINE_KWARGS = dict(
     tensor_parallel_size=1,
@@ -306,89 +313,133 @@ def _concatenate_conversations(text_ids_list, tokenizer,
 
 # ── Benchmark engine ───────────────────────────────────────────────────
 
-def run_one_mode(mode, all_groups, model_path, max_gen_tokens=50, num_iters=3):
-    """Run benchmark for one cache mode across all groups.
 
-    Returns: {target_blocks: [conv_result, ...]}
-    """
-    from vllm import LLM, SamplingParams
+def _align_triton_enabled() -> bool:
+    return bool(os.environ.get("GDN_ALIGN_TRITON_CONV1D", ""))
 
-    print(f"\n{'═' * 70}")
-    print(f"  MODE: {mode}")
-    print(f"  Groups: {sorted(all_groups.keys())} blocks")
-    print(f"  Iterations per conversation: {num_iters}")
-    print(f"{'═' * 70}")
 
-    llm = LLM(
+def _build_llm(mode, model_path):
+    from vllm import LLM
+
+    return LLM(
         model=model_path,
         **ENGINE_KWARGS,
         mamba_cache_mode=mode,
     )
-    sp = SamplingParams(temperature=0, max_tokens=max_gen_tokens)
+
+
+def _build_sampling_params(max_gen_tokens):
+    from vllm import SamplingParams
+
+    return SamplingParams(temperature=0, max_tokens=max_gen_tokens)
+
+
+def _first_pair(all_groups):
+    first_group = min(all_groups.keys())
+    return all_groups[first_group][0]
+
+
+def _measure_pair(llm, sp, pair):
+    t0 = time.perf_counter()
+    r1_out = llm.generate([pair["r1_prompt"]], sp)
+    t1 = time.perf_counter()
+
+    t2 = time.perf_counter()
+    r2_out = llm.generate([pair["r2_prompt"]], sp)
+    t3 = time.perf_counter()
+
+    return {
+        "r1_ms": (t1 - t0) * 1000,
+        "r2_ms": (t3 - t2) * 1000,
+        "r1_output": r1_out[0].outputs[0].text,
+        "r2_output": r2_out[0].outputs[0].text,
+    }
+
+
+def _warmup_mode(mode, all_groups, model_path, max_gen_tokens):
+    pair = _first_pair(all_groups)
+    print(f"\n  Warmup ({mode}): compile on one prompt pair using a disposable engine")
+    llm = _build_llm(mode, model_path)
+    sp = _build_sampling_params(max_gen_tokens)
+    llm.generate([pair["r1_prompt"]], sp)
+    llm.generate([pair["r2_prompt"]], sp)
+    del llm
+
+
+def run_one_mode(mode, all_groups, model_path, max_gen_tokens=1, num_repeats=1, do_warmup=True):
+    """Run benchmark for one cache mode across all groups.
+
+    Each measured repeat uses a fresh engine so R1 keeps the intended
+    "fill cache" meaning and is not polluted by a previous repeat's cache.
+    """
+
+    print(f"\n{'═' * 70}")
+    print(f"  MODE: {mode}")
+    print(f"  Groups: {sorted(all_groups.keys())} blocks")
+    print(f"  Measured repeats (fresh engine): {num_repeats}")
+    print(f"  Warmup engine: {'on' if do_warmup else 'off'}")
+    print(f"  ALIGN Triton conv1d: {'on' if _align_triton_enabled() else 'off'}")
+    print(f"  max_tokens = {max_gen_tokens}")
+    print(f"{'═' * 70}")
+
+    if do_warmup:
+        _warmup_mode(mode, all_groups, model_path, max_gen_tokens)
 
     results = {}
     for target_blocks in sorted(all_groups.keys()):
         pairs = all_groups[target_blocks]
+        group_results = []
+        for pair in pairs:
+            group_results.append(
+                {
+                    "conv_idx": pair["conv_idx"],
+                    "prefix_tokens": pair["prefix_tokens"],
+                    "prefix_blocks": pair["prefix_blocks"],
+                    "r1_all_ms": [],
+                    "r2_all_ms": [],
+                    "r1_output": None,
+                    "r2_output": None,
+                }
+            )
+        results[target_blocks] = group_results
+
+    for repeat_idx in range(num_repeats):
+        print(f"\n  [Repeat {repeat_idx + 1}/{num_repeats}] Starting fresh engine")
+        llm = _build_llm(mode, model_path)
+        sp = _build_sampling_params(max_gen_tokens)
+
+        for target_blocks in sorted(all_groups.keys()):
+            pairs = all_groups[target_blocks]
+            for p_idx, pair in enumerate(pairs):
+                measured = _measure_pair(llm, sp, pair)
+                conv_result = results[target_blocks][p_idx]
+                conv_result["r1_all_ms"].append(measured["r1_ms"])
+                conv_result["r2_all_ms"].append(measured["r2_ms"])
+                if repeat_idx == 0:
+                    conv_result["r1_output"] = measured["r1_output"]
+                    conv_result["r2_output"] = measured["r2_output"]
+
+        del llm
+
+    for target_blocks in sorted(results.keys()):
         print(f"\n  ── Group: {target_blocks} blocks "
               f"({target_blocks * BLOCK_SIZE} tokens) "
-              f"── {len(pairs)} conversations ──")
-
-        group_results = []
-        for p_idx, pair in enumerate(pairs):
-            r1_times = []
-            r2_times = []
-            r1_output = None
-            r2_output = None
-
-            for it in range(num_iters):
-                # R1: fill cache
-                t0 = time.perf_counter()
-                r1_out = llm.generate([pair["r1_prompt"]], sp)
-                t1 = time.perf_counter()
-                r1_times.append((t1 - t0) * 1000)
-
-                # R2: cache hit
-                t2 = time.perf_counter()
-                r2_out = llm.generate([pair["r2_prompt"]], sp)
-                t3 = time.perf_counter()
-                r2_times.append((t3 - t2) * 1000)
-
-                if it == 0:
-                    r1_output = r1_out[0].outputs[0].text
-                    r2_output = r2_out[0].outputs[0].text
-
-            # Exclude first iteration (cold compilation)
-            r2_warm = r2_times[1:] if len(r2_times) > 1 else r2_times
-            r1_warm = r1_times[1:] if len(r1_times) > 1 else r1_times
-
-            conv_result = {
-                "conv_idx": pair["conv_idx"],
-                "prefix_tokens": pair["prefix_tokens"],
-                "prefix_blocks": pair["prefix_blocks"],
-                "r1_all_ms": r1_times,
-                "r2_all_ms": r2_times,
-                "r1_mean_ms": statistics.mean(r1_warm),
-                "r2_mean_ms": statistics.mean(r2_warm),
-                "r1_output": r1_output,
-                "r2_output": r2_output,
-            }
-            group_results.append(conv_result)
-
+              f"── {len(results[target_blocks])} conversations ──")
+        for p_idx, conv_result in enumerate(results[target_blocks]):
+            conv_result["r1_mean_ms"] = statistics.mean(conv_result["r1_all_ms"])
+            conv_result["r2_mean_ms"] = statistics.mean(conv_result["r2_all_ms"])
             speedup = conv_result["r1_mean_ms"] / max(conv_result["r2_mean_ms"], 0.1)
-            print(f"    conv[{p_idx}]: prefix={pair['prefix_tokens']}tok "
+            print(f"    conv[{p_idx}]: prefix={conv_result['prefix_tokens']}tok "
                   f"R1={conv_result['r1_mean_ms']:.0f}ms "
                   f"R2={conv_result['r2_mean_ms']:.0f}ms "
                   f"(R1/R2={speedup:.1f}x)")
 
-        results[target_blocks] = group_results
-
-    del llm
     return results
 
 
 # ── Report ─────────────────────────────────────────────────────────────
 
-def print_report(all_results, align_results, groups, model_path=MODEL):
+def print_report(all_results, align_results, groups, model_path=MODEL, max_gen_tokens=MAX_GEN_TOKENS):
     """Print side-by-side comparison report."""
     alignment_step = ENGINE_KWARGS["max_num_batched_tokens"] // BLOCK_SIZE
 
@@ -400,7 +451,7 @@ def print_report(all_results, align_results, groups, model_path=MODEL):
           f"max_num_batched_tokens={ENGINE_KWARGS['max_num_batched_tokens']}")
     print(f"  alignment step = {alignment_step} blocks")
     print(f"  suffix ≈ {SUFFIX_TARGET_TOKENS} tokens, "
-          f"max_gen_tokens = {MAX_GEN_TOKENS}")
+          f"max_gen_tokens = {max_gen_tokens}")
 
     summary_rows = []
 
@@ -530,8 +581,8 @@ def main():
         "--convs-per-group", type=int, default=5,
         help="Conversations per group (default: 5)")
     parser.add_argument(
-        "--num-iters", type=int, default=3,
-        help="R1→R2 iterations per conversation (default: 3)")
+        "--num-repeats", "--num-iters", dest="num_repeats", type=int, default=1,
+        help="Measured repeats with a fresh engine per repeat (default: 1)")
     parser.add_argument(
         "--max-tokens", type=int, default=MAX_GEN_TOKENS,
         help=f"Max tokens to generate (default: {MAX_GEN_TOKENS})")
@@ -559,7 +610,20 @@ def main():
     parser.add_argument(
         "--load-prompts", type=str, default=None,
         help="Load pre-built prompt pairs from JSON (skip download+tokenize)")
+    parser.add_argument(
+        "--align-triton-conv1d",
+        action="store_true",
+        help="Set GDN_ALIGN_TRITON_CONV1D=1 before importing vLLM so ALIGN uses Triton conv1d.",
+    )
+    parser.add_argument(
+        "--skip-warmup",
+        action="store_true",
+        help="Skip the disposable warmup engine that compiles kernels before measured repeats.",
+    )
     args = parser.parse_args()
+
+    if args.align_triton_conv1d:
+        os.environ["GDN_ALIGN_TRITON_CONV1D"] = "1"
 
     # Apply source/mirror overrides
     global SHAREGPT_URL
@@ -666,15 +730,15 @@ def main():
 
     if args.mode in ("all", "both"):
         all_results = run_one_mode(
-            "all", all_groups, model_path, max_gen_tokens, args.num_iters)
+            "all", all_groups, model_path, max_gen_tokens, args.num_repeats, not args.skip_warmup)
 
     if args.mode in ("align", "both"):
         align_results = run_one_mode(
-            "align", all_groups, model_path, max_gen_tokens, args.num_iters)
+            "align", all_groups, model_path, max_gen_tokens, args.num_repeats, not args.skip_warmup)
 
     # ── Step 5: Report ──
     if all_results and align_results:
-        print_report(all_results, align_results, args.groups, model_path)
+        print_report(all_results, align_results, args.groups, model_path, max_gen_tokens)
     elif all_results:
         print("\n  Only all-mode results available.")
         for blk, group in all_results.items():
