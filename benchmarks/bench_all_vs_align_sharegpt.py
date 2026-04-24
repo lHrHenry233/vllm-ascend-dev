@@ -642,6 +642,9 @@ def main():
     # Export prompts if requested
     if args.export_prompts:
         export_path = args.export_prompts
+        export_parent = os.path.dirname(export_path)
+        if export_parent:
+            os.makedirs(export_parent, exist_ok=True)
         with open(export_path, "w") as f:
             json.dump(
                 {str(k): v for k, v in all_groups.items()},
