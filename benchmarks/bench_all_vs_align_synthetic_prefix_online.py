@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Synthetic online benchmark for ALL-vs-ALIGN prefix caching.
+"""Synthetic online benchmark for manual ALL-vs-ALIGN prefix-cache testing.
 
 This benchmark creates two long prompts with exact tokenizer-controlled lengths:
 
@@ -8,18 +8,22 @@ This benchmark creates two long prompts with exact tokenizer-controlled lengths:
 - R2 total prompt tokens
 - exact shared prefix tokens between R1 and R2
 
-It launches `vllm serve` for all/align, sends R1 -> R2 through the OpenAI
-completion API, and parses a server-side log line carrying actual
-`num_cached_tokens`.
+Unlike the earlier version, this script does not launch `vllm serve`.
+You must start the server manually in the foreground so runtime failures and
+stack traces stay visible in your terminal. The script only sends R1 -> R2
+through the OpenAI-compatible HTTP API and optionally follows a tee'd server
+log to read actual `[GDN_CACHE_HIT]` lines.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import re
-import statistics
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
@@ -27,7 +31,6 @@ if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
 import bench_all_vs_align_sharegpt as offline_base
-import bench_all_vs_align_sharegpt_online as online_base
 
 _CACHE_LOG_RE = re.compile(
     r"\[GDN_CACHE_HIT\] mode=(?P<mode>\S+) request_id=(?P<request_id>\S+) "
@@ -87,15 +90,15 @@ def build_exact_synthetic_prompts(tokenizer, shared_prefix_tokens: int, r1_total
     suffix_b_pool = _repeat_encode(tokenizer, _R2_SUFFIX_SEED, suffix_b_tokens + 128)
 
     for shared_offset in range(8):
-        shared_ids = shared_pool[shared_offset : shared_offset + shared_prefix_tokens]
+        shared_ids = shared_pool[shared_offset: shared_offset + shared_prefix_tokens]
         if len(shared_ids) < shared_prefix_tokens:
             continue
         for suffix_a_offset in range(8):
-            r1_ids = shared_ids + suffix_a_pool[suffix_a_offset : suffix_a_offset + suffix_a_tokens]
+            r1_ids = shared_ids + suffix_a_pool[suffix_a_offset: suffix_a_offset + suffix_a_tokens]
             if len(r1_ids) != r1_total_tokens:
                 continue
             for suffix_b_offset in range(8):
-                r2_ids = shared_ids + suffix_b_pool[suffix_b_offset : suffix_b_offset + suffix_b_tokens]
+                r2_ids = shared_ids + suffix_b_pool[suffix_b_offset: suffix_b_offset + suffix_b_tokens]
                 if len(r2_ids) != r2_total_tokens:
                     continue
                 r1_prompt = _decode(tokenizer, r1_ids)
@@ -123,6 +126,55 @@ def build_exact_synthetic_prompts(tokenizer, shared_prefix_tokens: int, r1_total
     )
 
 
+def _urlopen_json(url: str, data: dict | None = None, timeout: float = 30.0) -> dict:
+    body = None
+    headers = {}
+    if data is not None:
+        body = json.dumps(data).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=body, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {exc.code} from {url}\n{detail}") from exc
+
+
+class ExternalOpenAIClient:
+    def __init__(
+        self,
+        mode: str,
+        base_url: str,
+        request_timeout: float,
+        model_id: str | None = None,
+    ) -> None:
+        self.mode = mode
+        self.base_url = base_url.rstrip("/")
+        self.request_timeout = request_timeout
+        self.model_id = model_id
+
+    def ensure_model_id(self) -> str:
+        if self.model_id is None:
+            models = _urlopen_json(f"{self.base_url}/v1/models", timeout=5.0)
+            self.model_id = models["data"][0]["id"]
+        return self.model_id
+
+    def generate(self, prompt: str, max_tokens: int) -> str:
+        payload = {
+            "model": self.ensure_model_id(),
+            "prompt": prompt,
+            "max_tokens": max_tokens,
+            "temperature": 0,
+        }
+        data = _urlopen_json(
+            f"{self.base_url}/v1/completions",
+            data=payload,
+            timeout=self.request_timeout,
+        )
+        return data["choices"][0]["text"]
+
+
 def wait_for_cache_log(log_path: Path, start_offset: int, expected_mode: str, timeout: float):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -130,30 +182,36 @@ def wait_for_cache_log(log_path: Path, start_offset: int, expected_mode: str, ti
             with log_path.open("r", encoding="utf-8", errors="replace") as f:
                 f.seek(start_offset)
                 chunk = f.read()
-                if chunk:
-                    for line in chunk.splitlines():
-                        match = _CACHE_LOG_RE.search(line)
-                        if not match:
-                            continue
-                        info = match.groupdict()
-                        if info["mode"] != expected_mode:
-                            continue
-                        info["prompt_tokens"] = int(info["prompt_tokens"])
-                        info["total_tokens"] = int(info["total_tokens"])
-                        info["cached_tokens"] = int(info["cached_tokens"])
-                        info["hit_rate"] = float(info["hit_rate"])
-                        info["finished"] = info["finished"] == "True"
-                        return info
+            if chunk:
+                for line in chunk.splitlines():
+                    match = _CACHE_LOG_RE.search(line)
+                    if not match:
+                        continue
+                    info = match.groupdict()
+                    if info["mode"] != expected_mode:
+                        continue
+                    info["prompt_tokens"] = int(info["prompt_tokens"])
+                    info["total_tokens"] = int(info["total_tokens"])
+                    info["cached_tokens"] = int(info["cached_tokens"])
+                    info["hit_rate"] = float(info["hit_rate"])
+                    info["finished"] = info["finished"] == "True"
+                    return info
         time.sleep(0.2)
     raise TimeoutError(f"Timed out waiting for cache-hit log in {log_path}")
 
 
-def _send_one_request(server: online_base.LocalOpenAIServer, prompt: str, max_tokens: int):
-    start_offset = server.log_path.stat().st_size if server.log_path.exists() else 0
+def _send_one_request(
+    client: ExternalOpenAIClient,
+    log_path: Path,
+    prompt: str,
+    max_tokens: int,
+    cache_log_timeout: float,
+):
+    start_offset = log_path.stat().st_size if log_path.exists() else 0
     t0 = time.perf_counter()
-    text = server.generate(prompt, max_tokens)
+    text = client.generate(prompt, max_tokens)
     t1 = time.perf_counter()
-    cache_info = wait_for_cache_log(server.log_path, start_offset, server.mode, timeout=15.0)
+    cache_info = wait_for_cache_log(log_path, start_offset, client.mode, timeout=cache_log_timeout)
     return {
         "text": text,
         "ms": (t1 - t0) * 1000,
@@ -161,73 +219,65 @@ def _send_one_request(server: online_base.LocalOpenAIServer, prompt: str, max_to
     }
 
 
-def _warmup_mode(mode: str, model_path: str, args: argparse.Namespace, results_dir: Path, prompts: dict):
-    warmup_dir = results_dir / f"{mode}_warmup"
-    print(f"\n  Warmup ({mode}): disposable server")
-    with online_base.LocalOpenAIServer(mode, model_path, args, warmup_dir) as server:
-        _send_one_request(server, prompts["r1_prompt"], args.max_tokens)
-
-
-def run_one_mode(mode: str, prompts: dict, args: argparse.Namespace, results_dir: Path):
+def run_one_mode(mode: str, prompts: dict, args: argparse.Namespace):
     expected_hit_tokens = prompts["shared_prefix_tokens"] if mode == "all" else 0
     expected_hit_rate = expected_hit_tokens / prompts["r2_total_tokens"]
+    log_path = Path(args.server_log_path)
+    client = ExternalOpenAIClient(
+        mode=mode,
+        base_url=args.base_url,
+        request_timeout=args.request_timeout,
+        model_id=args.model_id,
+    )
 
-    print(f"\n{'═' * 76}")
-    print(f"  MODE: {mode} (online synthetic)")
-    print(f"  Prompt geometry: shared={prompts['shared_prefix_tokens']} "
-          f"r1_total={prompts['r1_total_tokens']} r2_total={prompts['r2_total_tokens']}")
-    print(f"  Expected R2 hits: {expected_hit_tokens} tokens "
-          f"({expected_hit_rate:.4%})")
-    print(f"{'═' * 76}")
+    print(f"\n{'=' * 76}")
+    print(f"  MODE: {mode} (manual online synthetic)")
+    print(f"  Base URL: {args.base_url}")
+    print(f"  Server log: {log_path}")
+    print(
+        f"  Prompt geometry: shared={prompts['shared_prefix_tokens']} "
+        f"r1_total={prompts['r1_total_tokens']} r2_total={prompts['r2_total_tokens']}"
+    )
+    print(f"  Expected R2 hits: {expected_hit_tokens} tokens ({expected_hit_rate:.4%})")
+    print(f"{'=' * 76}")
 
-    if not args.skip_warmup:
-        _warmup_mode(mode, args.model, args, results_dir, prompts)
+    model_id = client.ensure_model_id()
+    print(f"  Connected model_id={model_id}")
+    r1 = _send_one_request(client, log_path, prompts["r1_prompt"], args.max_tokens, args.cache_log_timeout)
+    r2 = _send_one_request(client, log_path, prompts["r2_prompt"], args.max_tokens, args.cache_log_timeout)
 
-    results = []
-    for repeat_idx in range(args.num_repeats):
-        repeat_dir = results_dir / f"{mode}_repeat{repeat_idx + 1}"
-        print(f"\n  [Repeat {repeat_idx + 1}/{args.num_repeats}] Starting fresh server")
-        with online_base.LocalOpenAIServer(mode, args.model, args, repeat_dir) as server:
-            r1 = _send_one_request(server, prompts["r1_prompt"], args.max_tokens)
-            r2 = _send_one_request(server, prompts["r2_prompt"], args.max_tokens)
-            results.append({"r1": r1, "r2": r2})
-
-            print(
-                "    R1: "
-                f"{r1['ms']:.1f} ms, cached={r1['cache']['cached_tokens']} "
-                f"({r1['cache']['hit_rate']:.4%})"
-            )
-            print(
-                "    R2: "
-                f"{r2['ms']:.1f} ms, cached={r2['cache']['cached_tokens']} "
-                f"({r2['cache']['hit_rate']:.4%})"
-            )
-
-    r1_mean = statistics.mean(item["r1"]["ms"] for item in results)
-    r2_mean = statistics.mean(item["r2"]["ms"] for item in results)
-    actual_cached_mean = statistics.mean(item["r2"]["cache"]["cached_tokens"] for item in results)
-    actual_hit_rate_mean = statistics.mean(item["r2"]["cache"]["hit_rate"] for item in results)
+    print(
+        "    R1: "
+        f"{r1['ms']:.1f} ms, cached={r1['cache']['cached_tokens']} "
+        f"({r1['cache']['hit_rate']:.4%})"
+    )
+    print(
+        "    R2: "
+        f"{r2['ms']:.1f} ms, cached={r2['cache']['cached_tokens']} "
+        f"({r2['cache']['hit_rate']:.4%})"
+    )
 
     return {
         "mode": mode,
         "expected_hit_tokens": expected_hit_tokens,
         "expected_hit_rate": expected_hit_rate,
-        "r1_mean_ms": r1_mean,
-        "r2_mean_ms": r2_mean,
-        "actual_cached_tokens_mean": actual_cached_mean,
-        "actual_hit_rate_mean": actual_hit_rate_mean,
-        "r1_output": results[0]["r1"]["text"],
-        "r2_output": results[0]["r2"]["text"],
+        "r1_ms": r1["ms"],
+        "r2_ms": r2["ms"],
+        "actual_cached_tokens": r2["cache"]["cached_tokens"],
+        "actual_hit_rate": r2["cache"]["hit_rate"],
+        "r1_output": r1["text"],
+        "r2_output": r2["text"],
     }
 
 
-def print_summary(prompts: dict, all_result: dict | None, align_result: dict | None):
-    print(f"\n{'═' * 80}")
+def print_summary(prompts: dict, args: argparse.Namespace, result: dict):
+    print(f"\n{'=' * 80}")
     print("  SYNTHETIC PREFIX CACHE REPORT")
-    print(f"{'═' * 80}")
+    print(f"{'=' * 80}")
     print(
-        f"  shared_prefix_tokens={prompts['shared_prefix_tokens']} "
-        f"({prompts['shared_prefix_tokens'] // 4096} blocks), "
+        f"  mode={result['mode']}, "
+        f"shared_prefix_tokens={prompts['shared_prefix_tokens']} "
+        f"({prompts['shared_prefix_tokens'] // args.block_size} blocks), "
         f"r1_total={prompts['r1_total_tokens']}, "
         f"r2_total={prompts['r2_total_tokens']}"
     )
@@ -235,35 +285,20 @@ def print_summary(prompts: dict, all_result: dict | None, align_result: dict | N
         f"  suffix_A={prompts['suffix_a_tokens']} tokens, "
         f"suffix_B={prompts['suffix_b_tokens']} tokens"
     )
-
-    if all_result:
-        print(
-            f"\n  ALL  : R1={all_result['r1_mean_ms']:.1f} ms  "
-            f"R2={all_result['r2_mean_ms']:.1f} ms  "
-            f"expected_cached={all_result['expected_hit_tokens']}  "
-            f"actual_cached≈{all_result['actual_cached_tokens_mean']:.1f}  "
-            f"actual_hit_rate≈{all_result['actual_hit_rate_mean']:.4%}"
-        )
-    if align_result:
-        print(
-            f"  ALIGN: R1={align_result['r1_mean_ms']:.1f} ms  "
-            f"R2={align_result['r2_mean_ms']:.1f} ms  "
-            f"expected_cached={align_result['expected_hit_tokens']}  "
-            f"actual_cached≈{align_result['actual_cached_tokens_mean']:.1f}  "
-            f"actual_hit_rate≈{align_result['actual_hit_rate_mean']:.4%}"
-        )
-    if all_result and align_result:
-        speedup = align_result["r2_mean_ms"] / max(all_result["r2_mean_ms"], 0.1)
-        print(f"\n  >>> ALL R2 speedup vs ALIGN R2: {speedup:.2f}x")
-        if round(all_result["actual_cached_tokens_mean"]) != all_result["expected_hit_tokens"]:
-            print("  ⚠ ALL actual cached tokens differ from expected geometry")
-        if round(align_result["actual_cached_tokens_mean"]) != align_result["expected_hit_tokens"]:
-            print("  ⚠ ALIGN actual cached tokens differ from expected geometry")
+    print(
+        f"  R1={result['r1_ms']:.1f} ms  "
+        f"R2={result['r2_ms']:.1f} ms  "
+        f"expected_cached={result['expected_hit_tokens']}  "
+        f"actual_cached={result['actual_cached_tokens']}  "
+        f"actual_hit_rate={result['actual_hit_rate']:.4%}"
+    )
+    if result["actual_cached_tokens"] != result["expected_hit_tokens"]:
+        print("  WARNING: actual cached tokens differ from expected geometry")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Online synthetic ALL-vs-ALIGN prefix cache benchmark",
+        description="Manual online synthetic ALL-vs-ALIGN prefix cache benchmark",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--model", type=str, default="/data/Qwen3.5-9B")
@@ -273,30 +308,33 @@ def main():
     parser.add_argument("--block-size", type=int, default=4096)
     parser.add_argument("--max-num-batched-tokens", type=int, default=16384)
     parser.add_argument("--max-model-len", type=int, default=32768)
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.7)
     parser.add_argument("--max-tokens", type=int, default=1)
-    parser.add_argument("--mode", choices=["all", "align", "both"], default="both")
-    parser.add_argument("--num-repeats", type=int, default=1)
-    parser.add_argument("--align-triton-conv1d", action="store_true")
-    parser.add_argument("--skip-warmup", action="store_true")
-    parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--port", type=int, default=8100)
-    parser.add_argument("--startup-timeout", type=int, default=300)
+    parser.add_argument("--mode", choices=["all", "align"], required=True)
+    parser.add_argument("--base-url", type=str, default="http://127.0.0.1:8100")
+    parser.add_argument("--model-id", type=str, default=None)
+    parser.add_argument("--server-log-path", type=str, default=None)
     parser.add_argument("--request-timeout", type=float, default=600.0)
-    parser.add_argument("--served-model-name", type=str, default=None)
-    parser.add_argument("--results-dir", type=str, default=None)
-    parser.add_argument("--log-cached-tokens", action="store_true", default=True)
-    parser.add_argument("--no-log-cached-tokens", action="store_false", dest="log_cached_tokens")
-    parser.set_defaults(trust_remote_code=True)
-    parser.add_argument("--no-trust-remote-code", action="store_false", dest="trust_remote_code")
+    parser.add_argument("--cache-log-timeout", type=float, default=30.0)
+    parser.add_argument("--num-repeats", type=int, default=1)
+    parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
+
+    if args.num_repeats != 1:
+        parser.error(
+            "manual mode only supports --num-repeats 1 because the server cache must "
+            "start fresh for each measured run; restart the server and rerun instead"
+        )
+    if not args.dry_run and not args.server_log_path:
+        parser.error("--server-log-path is required unless --dry-run is used")
 
     print(f"\nLoading tokenizer from {args.model} ...")
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
-    print(f"✓ Tokenizer loaded from {getattr(tokenizer, 'name_or_path', args.model)} "
-          f"(vocab_size={tokenizer.vocab_size})")
+    print(
+        f"✓ Tokenizer loaded from {getattr(tokenizer, 'name_or_path', args.model)} "
+        f"(vocab_size={tokenizer.vocab_size})"
+    )
 
     prompts = build_exact_synthetic_prompts(
         tokenizer,
@@ -307,7 +345,7 @@ def main():
 
     shared_blocks = prompts["shared_prefix_tokens"] // args.block_size
     align_step_blocks = args.max_num_batched_tokens // args.block_size
-    print(f"\n  Prompt geometry")
+    print("\n  Prompt geometry")
     print(f"    shared_prefix_tokens = {prompts['shared_prefix_tokens']}")
     print(f"    shared_prefix_blocks = {shared_blocks}")
     print(f"    r1_total_tokens      = {prompts['r1_total_tokens']}")
@@ -322,21 +360,13 @@ def main():
         print("\n  [DRY RUN] Prompt construction complete.")
         return
 
-    results_dir = Path(
-        args.results_dir
-        or f"benchmarks/results/synthetic_prefix_online_{time.strftime('%Y%m%d_%H%M%S')}"
-    )
-    results_dir.mkdir(parents=True, exist_ok=True)
+    print("\n  Manual serve requirements")
+    print("    1. Start vllm serve yourself in the foreground.")
+    print("    2. Export GDN_BENCH_LOG_CACHED_TOKENS=1 before serve.")
+    print("    3. Pipe stdout/stderr through tee and pass the same file to --server-log-path.")
 
-    all_result = None
-    align_result = None
-    if args.mode in ("all", "both"):
-        all_result = run_one_mode("all", prompts, args, results_dir)
-    if args.mode in ("align", "both"):
-        align_result = run_one_mode("align", prompts, args, results_dir)
-
-    print_summary(prompts, all_result, align_result)
-    print(f"\n  Results directory: {results_dir}")
+    result = run_one_mode(args.mode, prompts, args)
+    print_summary(prompts, args, result)
 
 
 if __name__ == "__main__":
