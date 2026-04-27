@@ -296,6 +296,51 @@ def print_summary(prompts: dict, args: argparse.Namespace, result: dict):
         print("  WARNING: actual cached tokens differ from expected geometry")
 
 
+def export_prompts(prompts: dict, args: argparse.Namespace) -> None:
+    export_dir = Path(args.export_prompts_dir)
+    export_dir.mkdir(parents=True, exist_ok=True)
+
+    r1_txt = export_dir / "r1.txt"
+    r2_txt = export_dir / "r2.txt"
+    r1_json = export_dir / "r1.json"
+    r2_json = export_dir / "r2.json"
+
+    r1_txt.write_text(prompts["r1_prompt"], encoding="utf-8")
+    r2_txt.write_text(prompts["r2_prompt"], encoding="utf-8")
+
+    model_name = args.model_id or args.model
+    r1_json.write_text(
+        json.dumps(
+            {
+                "model": model_name,
+                "prompt": prompts["r1_prompt"],
+                "max_tokens": args.max_tokens,
+                "temperature": 0,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    r2_json.write_text(
+        json.dumps(
+            {
+                "model": model_name,
+                "prompt": prompts["r2_prompt"],
+                "max_tokens": args.max_tokens,
+                "temperature": 0,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    print("\n  Exported prompt artifacts")
+    print(f"    {r1_txt}")
+    print(f"    {r2_txt}")
+    print(f"    {r1_json}")
+    print(f"    {r2_json}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Manual online synthetic ALL-vs-ALIGN prefix cache benchmark",
@@ -312,6 +357,7 @@ def main():
     parser.add_argument("--mode", choices=["all", "align"], required=True)
     parser.add_argument("--base-url", type=str, default="http://127.0.0.1:8100")
     parser.add_argument("--model-id", type=str, default=None)
+    parser.add_argument("--export-prompts-dir", type=str, default=None)
     parser.add_argument("--server-log-path", type=str, default=None)
     parser.add_argument("--request-timeout", type=float, default=600.0)
     parser.add_argument("--cache-log-timeout", type=float, default=30.0)
@@ -336,12 +382,14 @@ def main():
         f"(vocab_size={tokenizer.vocab_size})"
     )
 
+    print("\nBuilding exact synthetic prompts ...")
     prompts = build_exact_synthetic_prompts(
         tokenizer,
         shared_prefix_tokens=args.shared_prefix_tokens,
         r1_total_tokens=args.r1_total_tokens,
         r2_total_tokens=args.r2_total_tokens,
     )
+    print("✓ Synthetic prompts constructed")
 
     shared_blocks = prompts["shared_prefix_tokens"] // args.block_size
     align_step_blocks = args.max_num_batched_tokens // args.block_size
@@ -355,6 +403,10 @@ def main():
     print(f"    ALIGN step blocks    = {align_step_blocks}")
     print(f"    ALL expected hits    = {shared_blocks}")
     print(f"    ALIGN expected hits  = {(shared_blocks // align_step_blocks) * align_step_blocks}")
+
+    if args.export_prompts_dir:
+        print(f"\nExporting prompt artifacts to {args.export_prompts_dir} ...")
+        export_prompts(prompts, args)
 
     if args.dry_run:
         print("\n  [DRY RUN] Prompt construction complete.")
