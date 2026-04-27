@@ -72,6 +72,11 @@ class LocalOpenAIServer:
             "--max-num-batched-tokens",
             str(self.args.max_num_batched_tokens),
         ]
+        block_size = getattr(self.args, "block_size", None)
+        if block_size is not None:
+            cmd.extend(["--block-size", str(block_size)])
+        if getattr(self.args, "trust_remote_code", False):
+            cmd.append("--trust-remote-code")
         if self.args.served_model_name:
             cmd.extend(["--served-model-name", self.args.served_model_name])
         return cmd
@@ -90,6 +95,8 @@ class LocalOpenAIServer:
         env = os.environ.copy()
         if self.args.align_triton_conv1d:
             env["GDN_ALIGN_TRITON_CONV1D"] = "1"
+        if getattr(self.args, "log_cached_tokens", False):
+            env["GDN_BENCH_LOG_CACHED_TOKENS"] = "1"
         self.proc = subprocess.Popen(
             cmd,
             stdout=self.log_file,
