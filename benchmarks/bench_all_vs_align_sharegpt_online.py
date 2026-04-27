@@ -164,12 +164,17 @@ def load_or_build_groups(args: argparse.Namespace, model_path: str):
 
     if args.load_prompts:
         print(f"\nLoading pre-built prompts from {args.load_prompts} ...")
-        with open(args.load_prompts) as f:
-            saved = json.load(f)
-        all_groups = {int(k): v for k, v in saved.items()}
+        saved_groups, prompt_meta = offline_base._load_prompt_file(args.load_prompts)
+        all_groups = {int(k): v for k, v in saved_groups.items()}
         if args.groups != offline_base.DEFAULT_GROUPS:
             all_groups = {k: v for k, v in all_groups.items() if k in args.groups}
         print(f"✓ Loaded {sum(len(v) for v in all_groups.values())} prompt pairs across {len(all_groups)} groups")
+        if prompt_meta:
+            built_tokenizer = prompt_meta.get("tokenizer_name_or_path")
+            built_model = prompt_meta.get("model_path")
+            print(f"  Prompt meta: model={built_model}, tokenizer={built_tokenizer}")
+            if built_tokenizer and os.path.abspath(str(built_tokenizer)) != os.path.abspath(model_path):
+                print("  ⚠ Prompt JSON tokenizer path does not match current --model path.")
     else:
         data_path = args.data_path or offline_base.download_sharegpt()
         conversations = offline_base.load_conversations(data_path)
@@ -178,7 +183,8 @@ def load_or_build_groups(args: argparse.Namespace, model_path: str):
         from transformers import AutoTokenizer
 
         tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        print(f"✓ Tokenizer loaded (vocab_size={tokenizer.vocab_size})")
+        print(f"✓ Tokenizer loaded from {getattr(tokenizer, 'name_or_path', model_path)} "
+              f"(vocab_size={tokenizer.vocab_size})")
 
         min_blocks = min(args.groups)
         min_min_tokens = min_blocks * offline_base.BLOCK_SIZE + offline_base.SUFFIX_TARGET_TOKENS

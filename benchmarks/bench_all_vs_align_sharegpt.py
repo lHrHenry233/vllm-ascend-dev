@@ -223,14 +223,72 @@ def build_prompt_pairs(scored, tokenizer, target_blocks,
 
     # Build a suffix pool from all candidates (for suffix_B)
     suffix_pool = []
-    for _, _, ids in valid:
+    for conv_idx, _, ids in valid:
         s_ids = ids[target_tokens: target_tokens + suffix_tokens]
         if len(s_ids) >= suffix_tokens // 2:
-            suffix_pool.append(tokenizer.decode(s_ids))
+            suffix_pool.append({
+                "conv_idx": conv_idx,
+                "suffix_ids": s_ids,
+            })
 
     if not suffix_pool:
         print(f"  ✗ No valid suffixes found for {target_blocks}-block prefix")
         return []
+
+    def _decode(ids):
+        return tokenizer.decode(
+            ids,
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+
+    def _common_prefix_len(a_ids, b_ids):
+        limit = min(len(a_ids), len(b_ids))
+        for i in range(limit):
+            if a_ids[i] != b_ids[i]:
+                return i
+        return limit
+
+    def _build_exact_pair(conv_idx, prefix_ids, sa_ids, sb_ids):
+        prefix_text = _decode(prefix_ids)
+        suffix_a = _decode(sa_ids)
+        suffix_b = _decode(sb_ids)
+        r1_prompt = _decode(prefix_ids + sa_ids)
+        r2_prompt = _decode(prefix_ids + sb_ids)
+
+        r1_full_ids = tokenizer.encode(r1_prompt, add_special_tokens=False)
+        r2_full_ids = tokenizer.encode(r2_prompt, add_special_tokens=False)
+
+        if len(r1_full_ids) < target_tokens or len(r2_full_ids) < target_tokens:
+            return None
+        if r1_full_ids[:target_tokens] != prefix_ids:
+            return None
+        if r2_full_ids[:target_tokens] != prefix_ids:
+            return None
+
+        shared_prefix_tokens = _common_prefix_len(r1_full_ids, r2_full_ids)
+        if shared_prefix_tokens != target_tokens:
+            return None
+
+        prefix_actual = target_tokens
+        sa_actual = len(r1_full_ids) - shared_prefix_tokens
+        sb_actual = len(r2_full_ids) - shared_prefix_tokens
+        if sa_actual < suffix_tokens // 2 or sb_actual < suffix_tokens // 2:
+            return None
+
+        return {
+            "conv_idx": conv_idx,
+            "prefix": prefix_text,
+            "suffix_A": suffix_a,
+            "suffix_B": suffix_b,
+            "prefix_tokens": prefix_actual,
+            "prefix_blocks": (prefix_actual + block_size - 1) // block_size,
+            "suffix_A_tokens": sa_actual,
+            "suffix_B_tokens": sb_actual,
+            "shared_prefix_tokens": shared_prefix_tokens,
+            "r1_prompt": r1_prompt,
+            "r2_prompt": r2_prompt,
+        }
 
     # Construct pairs
     pairs = []
@@ -239,37 +297,28 @@ def build_prompt_pairs(scored, tokenizer, target_blocks,
             break
 
         prefix_ids = ids[:target_tokens]
-        prefix_text = tokenizer.decode(prefix_ids)
-
-        # suffix_A: from same conversation
         sa_ids = ids[target_tokens: target_tokens + suffix_tokens]
         if len(sa_ids) < suffix_tokens // 2:
             continue
-        suffix_a = tokenizer.decode(sa_ids)
 
-        # suffix_B: from a different conversation
-        sb_idx = (idx + 1) % len(suffix_pool)
-        if sb_idx == idx:
-            sb_idx = (idx + 2) % len(suffix_pool)
-        suffix_b = suffix_pool[sb_idx]
+        exact_pair = None
+        for offset in range(1, len(suffix_pool) + 1):
+            sb_entry = suffix_pool[(idx + offset) % len(suffix_pool)]
+            if sb_entry["conv_idx"] == conv_i:
+                continue
+            exact_pair = _build_exact_pair(
+                conv_i,
+                prefix_ids,
+                sa_ids,
+                sb_entry["suffix_ids"],
+            )
+            if exact_pair is not None:
+                break
 
-        # Verify actual token counts after decode roundtrip
-        prefix_actual = len(tokenizer.encode(prefix_text, add_special_tokens=False))
-        sa_actual = len(tokenizer.encode(suffix_a, add_special_tokens=False))
-        sb_actual = len(tokenizer.encode(suffix_b, add_special_tokens=False))
+        if exact_pair is None:
+            continue
 
-        pairs.append({
-            "conv_idx": conv_i,
-            "prefix": prefix_text,
-            "suffix_A": suffix_a,
-            "suffix_B": suffix_b,
-            "prefix_tokens": prefix_actual,
-            "prefix_blocks": (prefix_actual + block_size - 1) // block_size,
-            "suffix_A_tokens": sa_actual,
-            "suffix_B_tokens": sb_actual,
-            "r1_prompt": prefix_text + suffix_a,
-            "r2_prompt": prefix_text + suffix_b,
-        })
+        pairs.append(exact_pair)
 
     return pairs
 
@@ -563,8 +612,18 @@ def print_data_summary(all_groups):
             print(f"    [{i}] prefix={p['prefix_tokens']}tok "
                   f"({p['prefix_blocks']} blocks)  "
                   f"sA={p['suffix_A_tokens']}tok  sB={p['suffix_B_tokens']}tok  "
+                  f"shared={p.get('shared_prefix_tokens', p['prefix_tokens'])}tok  "
                   f"r1_total={p['prefix_tokens']+p['suffix_A_tokens']}tok  "
                   f"r2_total={p['prefix_tokens']+p['suffix_B_tokens']}tok")
+
+
+def _load_prompt_file(path):
+    with open(path, "r", encoding="utf-8") as f:
+        saved = json.load(f)
+
+    if isinstance(saved, dict) and isinstance(saved.get("groups"), dict):
+        return saved["groups"], saved.get("_meta")
+    return saved, None
 
 
 # ── Main ───────────────────────────────────────────────────────────────
@@ -643,17 +702,23 @@ def main():
     t_start = time.time()
 
     # ── Load pre-built prompts or build from scratch ──
+    prompt_meta = None
     if args.load_prompts:
         print(f"\nLoading pre-built prompts from {args.load_prompts} ...")
-        with open(args.load_prompts) as f:
-            saved = json.load(f)
-        all_groups = {int(k): v for k, v in saved.items()}
+        saved_groups, prompt_meta = _load_prompt_file(args.load_prompts)
+        all_groups = {int(k): v for k, v in saved_groups.items()}
         # Filter to requested groups
         if args.groups != DEFAULT_GROUPS:
             all_groups = {k: v for k, v in all_groups.items()
                           if k in args.groups}
         print(f"✓ Loaded {sum(len(v) for v in all_groups.values())} "
               f"prompt pairs across {len(all_groups)} groups")
+        if prompt_meta:
+            built_tokenizer = prompt_meta.get("tokenizer_name_or_path")
+            built_model = prompt_meta.get("model_path")
+            print(f"  Prompt meta: model={built_model}, tokenizer={built_tokenizer}")
+            if built_tokenizer and os.path.abspath(str(built_tokenizer)) != os.path.abspath(model_path):
+                print("  ⚠ Prompt JSON tokenizer path does not match current --model path.")
     else:
         # ── Step 1: Load data ──
         data_path = args.data_path or download_sharegpt()
@@ -664,7 +729,14 @@ def main():
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(
             model_path, trust_remote_code=True)
-        print(f"✓ Tokenizer loaded (vocab_size={tokenizer.vocab_size})")
+        prompt_meta = {
+            "model_path": model_path,
+            "tokenizer_name_or_path": getattr(tokenizer, "name_or_path", model_path),
+            "block_size": BLOCK_SIZE,
+            "suffix_target_tokens": SUFFIX_TARGET_TOKENS,
+        }
+        print(f"✓ Tokenizer loaded from {prompt_meta['tokenizer_name_or_path']} "
+              f"(vocab_size={tokenizer.vocab_size})")
 
         # ── Step 3: Tokenize once (with smallest group's threshold) ──
         min_blocks = min(args.groups)
@@ -709,11 +781,17 @@ def main():
         export_parent = os.path.dirname(export_path)
         if export_parent:
             os.makedirs(export_parent, exist_ok=True)
+        payload = {
+            "_meta": prompt_meta or {
+                "model_path": model_path,
+                "tokenizer_name_or_path": model_path,
+                "block_size": BLOCK_SIZE,
+                "suffix_target_tokens": SUFFIX_TARGET_TOKENS,
+            },
+            "groups": {str(k): v for k, v in all_groups.items()},
+        }
         with open(export_path, "w") as f:
-            json.dump(
-                {str(k): v for k, v in all_groups.items()},
-                f, ensure_ascii=False, indent=2,
-            )
+            json.dump(payload, f, ensure_ascii=False, indent=2)
         size_kb = os.path.getsize(export_path) / 1024
         print(f"\n✓ Exported prompts to {export_path} ({size_kb:.0f} KB)")
         if args.dry_run:
