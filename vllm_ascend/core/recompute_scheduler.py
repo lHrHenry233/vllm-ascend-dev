@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass, fields
@@ -45,6 +46,35 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.utils import ConstantList, record_function_or_nullcontext
+
+_GDN_BENCH_LOG_CACHED_TOKENS = bool(os.environ.get("GDN_BENCH_LOG_CACHED_TOKENS", ""))
+
+
+def _maybe_log_cached_tokens(vllm_config: VllmConfig, request: Request, req_id: str, finished: bool) -> None:
+    if not _GDN_BENCH_LOG_CACHED_TOKENS:
+        return
+
+    prompt_tokens = getattr(request, "num_prompt_tokens", None)
+    cached_tokens = getattr(request, "num_cached_tokens", None)
+    total_tokens = getattr(request, "num_tokens", None)
+    if prompt_tokens is None or cached_tokens is None or total_tokens is None:
+        return
+    if prompt_tokens <= 0 or cached_tokens < 0:
+        return
+
+    cache_config = getattr(vllm_config, "cache_config", None)
+    mode = getattr(cache_config, "mamba_cache_mode", "unknown")
+    hit_rate = cached_tokens / max(prompt_tokens, 1)
+    logger.info(
+        "[GDN_CACHE_HIT] mode=%s request_id=%s prompt_tokens=%d total_tokens=%d cached_tokens=%d hit_rate=%.6f finished=%s",
+        mode,
+        req_id,
+        prompt_tokens,
+        total_tokens,
+        cached_tokens,
+        hit_rate,
+        finished,
+    )
 
 
 # `spec_manager_map` in single_type_kv_cache_manager is a module-level dict
@@ -961,6 +991,7 @@ class RecomputeScheduler(Scheduler):
                         num_nans_in_logits=request.num_nans_in_logits,
                     )
                 )
+                _maybe_log_cached_tokens(self.vllm_config, request, req_id, stopped)
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
@@ -985,6 +1016,12 @@ class RecomputeScheduler(Scheduler):
                         trace_headers=request.trace_headers,
                         num_cached_tokens=request.num_cached_tokens,
                     )
+                )
+                _maybe_log_cached_tokens(
+                    self.vllm_config,
+                    request,
+                    request.request_id,
+                    True,
                 )
 
         # KV Connector: update state for finished KV Transfers.
